@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/jeffery/rss-agent/internal/agent"
@@ -12,6 +11,7 @@ import (
 	"github.com/jeffery/rss-agent/internal/push"
 	"github.com/jeffery/rss-agent/internal/rss"
 	"github.com/jeffery/rss-agent/internal/store"
+	"github.com/jeffery/rss-agent/internal/triage"
 )
 
 type RunOptions struct {
@@ -27,6 +27,7 @@ type RunSummary struct {
 	Analyzed    int
 	Pushed      int
 	LLMCostCNY  float64
+	Triage      triage.Stats
 	Errors      []error
 }
 
@@ -64,7 +65,9 @@ func RunOnce(ctx context.Context, cfg *config.Config, options RunOptions) (RunSu
 		}
 	}
 
-	candidates := filterCandidates(fetched.Items, seenIDs, cfg, options.IncludeSeen)
+	filtered := triage.Filter(fetched.Items, seenIDs, cfg.Profile, cfg.Settings, options.IncludeSeen, time.Now())
+	candidates := filtered.Items
+	summary.Triage = filtered.Stats
 	summary.Candidate = len(candidates)
 	if len(candidates) == 0 {
 		return summary, nil
@@ -165,37 +168,6 @@ func Watch(ctx context.Context, cfg *config.Config, options RunOptions) error {
 		case <-timer.C:
 		}
 	}
-}
-
-func filterCandidates(items []rss.Item, seenIDs map[string]bool, cfg *config.Config, includeSeen bool) []rss.Item {
-	lookback := time.Duration(cfg.Settings.LookbackHours) * time.Hour
-	cutoff := time.Now().Add(-lookback)
-	seenThisRun := map[string]bool{}
-	var candidates []rss.Item
-	for _, item := range items {
-		id := item.StableID()
-		if seenThisRun[id] {
-			continue
-		}
-		seenThisRun[id] = true
-		if !includeSeen && seenIDs[id] {
-			continue
-		}
-		if t := item.Time(); !t.IsZero() && t.Before(cutoff) {
-			continue
-		}
-		if excludedByLocalRules(item, cfg.Profile.Exclude) {
-			continue
-		}
-		if !matchesMustInclude(item, cfg.Profile.MustInclude) {
-			continue
-		}
-		candidates = append(candidates, item)
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].Time().After(candidates[j].Time())
-	})
-	return candidates
 }
 
 func selectPushes(results []agent.Result, minScore int, maxPushes int) []agent.Result {
@@ -314,40 +286,6 @@ func dayStart(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
 
-func excludedByLocalRules(item rss.Item, excludes []string) bool {
-	haystack := strings.ToLower(strings.Join([]string{
-		item.Title,
-		item.Summary,
-		item.Content,
-		strings.Join(item.Categories, " "),
-	}, " "))
-	for _, exclude := range excludes {
-		if exclude = strings.ToLower(strings.TrimSpace(exclude)); exclude != "" && strings.Contains(haystack, exclude) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchesMustInclude(item rss.Item, terms []string) bool {
-	if len(terms) == 0 {
-		return true
-	}
-	haystack := strings.ToLower(strings.Join([]string{
-		item.Title,
-		item.Summary,
-		item.Content,
-		strings.Join(item.Categories, " "),
-		strings.Join(item.FeedTags, " "),
-	}, " "))
-	for _, term := range terms {
-		if term = strings.ToLower(strings.TrimSpace(term)); term != "" && strings.Contains(haystack, term) {
-			return true
-		}
-	}
-	return false
-}
-
 func printSummary(summary RunSummary, runErr error) {
 	if runErr != nil {
 		fmt.Printf("RSS Agent 运行失败：%v\n", runErr)
@@ -357,4 +295,13 @@ func printSummary(summary RunSummary, runErr error) {
 	}
 	fmt.Printf("RSS Agent：抓取 %d 条，候选 %d 条，分析 %d 条，推送 %d 条。\n",
 		summary.Fetched, summary.Candidate, summary.Analyzed, summary.Pushed)
+	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
+		summary.Triage.Skipped(),
+		summary.Triage.Duplicate,
+		summary.Triage.Seen,
+		summary.Triage.Stale,
+		summary.Triage.Muted,
+		summary.Triage.Excluded,
+		summary.Triage.MissingRequired,
+		summary.Triage.Capped)
 }

@@ -202,6 +202,15 @@ func runOnce(args []string) error {
 	}
 	fmt.Printf("完成：抓取 %d 条，候选 %d 条，分析 %d 条，推送 %d 条。\n",
 		summary.Fetched, summary.Candidate, summary.Analyzed, summary.Pushed)
+	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
+		summary.Triage.Skipped(),
+		summary.Triage.Duplicate,
+		summary.Triage.Seen,
+		summary.Triage.Stale,
+		summary.Triage.Muted,
+		summary.Triage.Excluded,
+		summary.Triage.MissingRequired,
+		summary.Triage.Capped)
 	return err
 }
 
