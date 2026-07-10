@@ -100,9 +100,38 @@ type Budget struct {
 }
 
 type Push struct {
-	Console       bool   `yaml:"console"`
+	Console       bool         `yaml:"console"`
+	WebhookURL    string       `yaml:"webhook_url"`
+	WebhookURLEnv string       `yaml:"webhook_url_env"`
+	Feishu        WebhookPush  `yaml:"feishu,omitempty"`
+	DingTalk      WebhookPush  `yaml:"dingtalk,omitempty"`
+	Telegram      TelegramPush `yaml:"telegram,omitempty"`
+	Email         EmailPush    `yaml:"email,omitempty"`
+}
+
+type WebhookPush struct {
 	WebhookURL    string `yaml:"webhook_url"`
 	WebhookURLEnv string `yaml:"webhook_url_env"`
+}
+
+type TelegramPush struct {
+	BotToken    string `yaml:"bot_token"`
+	BotTokenEnv string `yaml:"bot_token_env"`
+	ChatID      string `yaml:"chat_id"`
+	ChatIDEnv   string `yaml:"chat_id_env"`
+}
+
+type EmailPush struct {
+	SMTPHost    string   `yaml:"smtp_host"`
+	SMTPPort    int      `yaml:"smtp_port"`
+	Username    string   `yaml:"username"`
+	UsernameEnv string   `yaml:"username_env"`
+	Password    string   `yaml:"password"`
+	PasswordEnv string   `yaml:"password_env"`
+	From        string   `yaml:"from"`
+	To          []string `yaml:"to"`
+	Subject     string   `yaml:"subject"`
+	StartTLS    *bool    `yaml:"start_tls,omitempty"`
 }
 
 type Feed struct {
@@ -216,6 +245,10 @@ func (c *Config) ApplyDefaults() {
 	if c.State.Path == "" {
 		c.State.Path = ".rss-agent/state.json"
 	}
+	if c.Push.Email.StartTLS == nil {
+		enabled := true
+		c.Push.Email.StartTLS = &enabled
+	}
 }
 
 func (c *Config) Validate() error {
@@ -255,6 +288,9 @@ func (c *Config) validateSingle() error {
 	if c.Settings.FullTextMinChars > c.Settings.FullTextMaxChars {
 		return errors.New("settings.full_text_max_chars must be greater than or equal to full_text_min_chars")
 	}
+	if err := c.validatePush(); err != nil {
+		return err
+	}
 	for _, model := range c.ModelCandidates() {
 		if model.Name == "" || isDisabled(model) {
 			continue
@@ -262,6 +298,26 @@ func (c *Config) validateSingle() error {
 		if !isSupportedProvider(model.Provider) {
 			return fmt.Errorf("目前支持 openai-compatible provider，收到 %q", model.Provider)
 		}
+	}
+	return nil
+}
+
+func (c *Config) validatePush() error {
+	telegramToken := c.TelegramBotToken()
+	telegramChatID := c.TelegramChatID()
+	if (telegramToken == "") != (telegramChatID == "") {
+		return errors.New("push.telegram requires both bot_token and chat_id")
+	}
+
+	email := c.Push.Email
+	if email.SMTPHost == "" {
+		if len(email.To) > 0 || email.Username != "" || email.Password != "" || email.From != "" {
+			return errors.New("push.email.smtp_host is required when email delivery is configured")
+		}
+		return nil
+	}
+	if len(email.To) == 0 {
+		return errors.New("push.email.to is required when email delivery is configured")
 	}
 	return nil
 }
@@ -434,13 +490,52 @@ func resolveModel(model Model) (ResolvedModel, error) {
 }
 
 func (c *Config) WebhookURL() string {
-	if c.Push.WebhookURL != "" {
-		return c.Push.WebhookURL
+	return resolveValue(c.Push.WebhookURL, c.Push.WebhookURLEnv)
+}
+
+func (c *Config) FeishuWebhookURL() string {
+	return resolveValue(c.Push.Feishu.WebhookURL, c.Push.Feishu.WebhookURLEnv)
+}
+
+func (c *Config) DingTalkWebhookURL() string {
+	return resolveValue(c.Push.DingTalk.WebhookURL, c.Push.DingTalk.WebhookURLEnv)
+}
+
+func (c *Config) TelegramBotToken() string {
+	return resolveValue(c.Push.Telegram.BotToken, c.Push.Telegram.BotTokenEnv)
+}
+
+func (c *Config) TelegramChatID() string {
+	return resolveValue(c.Push.Telegram.ChatID, c.Push.Telegram.ChatIDEnv)
+}
+
+func (c *Config) EmailUsername() string {
+	return resolveValue(c.Push.Email.Username, c.Push.Email.UsernameEnv)
+}
+
+func (c *Config) EmailPassword() string {
+	return resolveValue(c.Push.Email.Password, c.Push.Email.PasswordEnv)
+}
+
+func (c *Config) EmailSMTPPort() int {
+	if c.Push.Email.SMTPPort > 0 {
+		return c.Push.Email.SMTPPort
 	}
-	if c.Push.WebhookURLEnv != "" {
-		return os.Getenv(c.Push.WebhookURLEnv)
+	return 587
+}
+
+func (c *Config) EmailStartTLS() bool {
+	if c.Push.Email.StartTLS == nil {
+		return true
 	}
-	return ""
+	return *c.Push.Email.StartTLS
+}
+
+func resolveValue(value string, envName string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(strings.TrimSpace(envName)))
 }
 
 func (c *Config) EnabledFeeds() []Feed {
@@ -564,6 +659,7 @@ func firstNonEmpty(values ...string) string {
 
 func Sample() *Config {
 	candidateLimit := 24
+	startTLS := true
 	cfg := &Config{
 		Profile: Profile{
 			Language: "zh-CN",
@@ -635,6 +731,23 @@ func Sample() *Config {
 		Push: Push{
 			Console:       true,
 			WebhookURLEnv: "RSS_AGENT_WEBHOOK_URL",
+			Feishu: WebhookPush{
+				WebhookURLEnv: "FEISHU_WEBHOOK_URL",
+			},
+			DingTalk: WebhookPush{
+				WebhookURLEnv: "DINGTALK_WEBHOOK_URL",
+			},
+			Telegram: TelegramPush{
+				BotTokenEnv: "TELEGRAM_BOT_TOKEN",
+				ChatIDEnv:   "TELEGRAM_CHAT_ID",
+			},
+			Email: EmailPush{
+				SMTPPort:    587,
+				UsernameEnv: "RSS_AGENT_SMTP_USERNAME",
+				PasswordEnv: "RSS_AGENT_SMTP_PASSWORD",
+				Subject:     "RSS Agent Digest",
+				StartTLS:    &startTLS,
+			},
 		},
 		State: StateConfig{Path: ".rss-agent/state.json"},
 		Profiles: map[string]ProfileConfig{

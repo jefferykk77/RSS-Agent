@@ -191,7 +191,7 @@ go run ./cmd/rss-agent feedback remove block-feed <item-id> -profile default
 
 ## 推送
 
-默认结果会输出到控制台。设置 `RSS_AGENT_WEBHOOK_URL` 后，程序也会发送以下 JSON 到 webhook：
+默认结果会输出到控制台。通用 webhook 继续发送以下 JSON：
 
 ```json
 {
@@ -200,7 +200,31 @@ go run ./cmd/rss-agent feedback remove block-feed <item-id> -profile default
 }
 ```
 
-可将 webhook 接到自己的飞书、钉钉、Slack 或其他转发服务。
+所有渠道都可同时启用；每条投递都会以真实渠道名写入 `push_records`。某个渠道失败不会阻止其他渠道投递；只要至少一个渠道成功，该条目就会标记为已投递，失败渠道仍会保留错误记录供后续检查。
+
+```yaml
+push:
+  console: true
+  webhook_url_env: RSS_AGENT_WEBHOOK_URL # 通用 JSON webhook
+  feishu:
+    webhook_url_env: FEISHU_WEBHOOK_URL
+  dingtalk:
+    webhook_url_env: DINGTALK_WEBHOOK_URL
+  telegram:
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+  email:
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    username_env: RSS_AGENT_SMTP_USERNAME
+    password_env: RSS_AGENT_SMTP_PASSWORD
+    from: rss@example.com # 留空时使用 username
+    to: [reader@example.com]
+    subject: RSS Agent Digest
+    start_tls: true
+```
+
+飞书使用机器人文本消息，钉钉使用 Markdown 消息，Telegram 使用 Bot API 的 Markdown 消息。邮件使用 SMTP；默认端口为 `587`，默认启用 STARTTLS。`webhook_url`、Telegram token 和 SMTP 密码都可以直接写入配置，但建议只使用对应的环境变量。
 
 ## 命令速查
 

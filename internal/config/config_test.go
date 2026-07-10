@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestCandidateLimitDefaultsAndAllowsZero(t *testing.T) {
 	if got := (Settings{}).CandidateLimit(); got != 24 {
@@ -47,5 +50,63 @@ func TestResolveProfileKeepsScopedConfigAndInheritedModels(t *testing.T) {
 	}
 	if _, err := cfg.ResolveProfile("missing"); err == nil {
 		t.Fatal("ResolveProfile(missing) error = nil")
+	}
+}
+
+func TestPushConfigResolvesChannelSecrets(t *testing.T) {
+	cfg := Sample()
+	t.Setenv("FEISHU_WEBHOOK_URL", "https://feishu.example/webhook")
+	t.Setenv("DINGTALK_WEBHOOK_URL", "https://dingtalk.example/webhook")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "telegram-token")
+	t.Setenv("TELEGRAM_CHAT_ID", "telegram-chat")
+	t.Setenv("RSS_AGENT_SMTP_USERNAME", "rss@example.com")
+	t.Setenv("RSS_AGENT_SMTP_PASSWORD", "smtp-password")
+
+	if got := cfg.FeishuWebhookURL(); got != "https://feishu.example/webhook" {
+		t.Fatalf("FeishuWebhookURL() = %q", got)
+	}
+	if got := cfg.DingTalkWebhookURL(); got != "https://dingtalk.example/webhook" {
+		t.Fatalf("DingTalkWebhookURL() = %q", got)
+	}
+	if got := cfg.TelegramBotToken(); got != "telegram-token" {
+		t.Fatalf("TelegramBotToken() = %q", got)
+	}
+	if got := cfg.TelegramChatID(); got != "telegram-chat" {
+		t.Fatalf("TelegramChatID() = %q", got)
+	}
+	if got := cfg.EmailUsername(); got != "rss@example.com" {
+		t.Fatalf("EmailUsername() = %q", got)
+	}
+	if got := cfg.EmailPassword(); got != "smtp-password" {
+		t.Fatalf("EmailPassword() = %q", got)
+	}
+	if !cfg.EmailStartTLS() {
+		t.Fatal("EmailStartTLS() = false, want true")
+	}
+}
+
+func TestPushConfigValidation(t *testing.T) {
+	cfg := Sample()
+	cfg.Push.Telegram.BotToken = "token-only"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil for incomplete Telegram configuration")
+	}
+
+	cfg = Sample()
+	cfg.Push.Email.SMTPHost = "smtp.example.com"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil for email without recipients")
+	}
+}
+
+func TestSampleRoundTripsThroughYAML(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "")
+	t.Setenv("TELEGRAM_CHAT_ID", "")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := Save(path, Sample()); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
