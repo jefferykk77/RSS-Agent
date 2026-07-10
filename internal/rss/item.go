@@ -25,6 +25,9 @@ type Item struct {
 	UpdatedAt   time.Time
 	Summary     string
 	Content     string
+	// LocalScore and LocalReasons are runtime-only hints from deterministic triage.
+	LocalScore   int
+	LocalReasons []string
 }
 
 func (i Item) StableID() string {

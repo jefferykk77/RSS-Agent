@@ -13,14 +13,14 @@ go run ./cmd/rss-agent init
 - `profile.interests`：你在意什么。
 - `profile.exclude`：你不想看的内容。
 - `feeds`：RSS 订阅源。
-- `model.name`：可写死模型名，也可用 `${OPENAI_MODEL}`。
+- `models.primary`：首选模型；`models.fallback`：首选故障时才使用的模型。
 
 设置模型环境变量：
 
 ```bash
-$env:OPENAI_API_KEY="你的 key"
-$env:OPENAI_MODEL="你的模型名"
-# 可选：$env:OPENAI_BASE_URL="https://..."
+$env:ARK_API_KEY="你的火山方舟 API Key"
+$env:ARK_MODEL="你的火山方舟推理接入点 ID"
+# 可选：DEEPSEEK_API_KEY 和 DEEPSEEK_MODEL，用作低价熔断回退。
 ```
 
 运行一次：
@@ -28,6 +28,21 @@ $env:OPENAI_MODEL="你的模型名"
 ```bash
 go run ./cmd/rss-agent once
 ```
+
+## 本地筛选与成本
+
+模型调用前会先在本地去重、排除已读/过期/静默内容，再按优先词排序，并把每次模型候选限制为 24 条，减少不必要的 Token 消耗。规则写在 `profile` 和 `settings`：
+
+```yaml
+profile:
+  priority_terms: [Eino, AI Agent, Go, LLM]
+  muted_feeds: ["低价值来源名称"]
+  muted_tags: [招聘, 营销]
+settings:
+  max_candidates_per_run: 24 # 设为 0 表示不限制
+```
+
+命令完成后会输出每类本地跳过数量；进入模型的条目会附带本地命中理由，供模型参考但不强制推送。
 
 定时运行：
 
@@ -58,4 +73,3 @@ go run ./cmd/rss-agent list
 ## Eino 使用点
 
 核心筛选和总结逻辑在 `internal/agent`，使用 `github.com/cloudwego/eino-ext/components/model/openai` 创建 Eino `ChatModel`，再通过 `schema.Message` 把 RSS 条目批量交给模型评分、筛选和总结。
-

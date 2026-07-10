@@ -188,7 +188,8 @@ func systemPrompt(language string) string {
 2. 只在内容和用户兴趣强相关、信息密度高、可行动或有新意时 should_push=true。
 3. 排除营销味重、重复、空泛、纯融资或与用户排除项冲突的内容。
 4. 用 %s 输出摘要和理由。
-5. 只返回严格 JSON，不要 Markdown，不要解释。
+5. 输入中的 local_score 和 local_reasons 是本地规则的弱信号；可据此解释相关性，但仍要独立判断，不可仅因它们而推送。
+6. 只返回严格 JSON，不要 Markdown，不要解释。
 
 JSON 格式：
 [
@@ -207,44 +208,50 @@ JSON 格式：
 
 func buildUserPayload(profile config.Profile, items []rss.Item) string {
 	type promptItem struct {
-		ItemID     string   `json:"item_id"`
-		Feed       string   `json:"feed"`
-		FeedTags   []string `json:"feed_tags"`
-		Title      string   `json:"title"`
-		Link       string   `json:"link"`
-		Author     string   `json:"author,omitempty"`
-		Published  string   `json:"published,omitempty"`
-		Categories []string `json:"categories,omitempty"`
-		Snippet    string   `json:"snippet"`
+		ItemID       string   `json:"item_id"`
+		Feed         string   `json:"feed"`
+		FeedTags     []string `json:"feed_tags"`
+		Title        string   `json:"title"`
+		Link         string   `json:"link"`
+		Author       string   `json:"author,omitempty"`
+		Published    string   `json:"published,omitempty"`
+		Categories   []string `json:"categories,omitempty"`
+		Snippet      string   `json:"snippet"`
+		LocalScore   int      `json:"local_score,omitempty"`
+		LocalReasons []string `json:"local_reasons,omitempty"`
 	}
 	payload := struct {
-		Now         string       `json:"now"`
-		Language    string       `json:"language"`
-		Timezone    string       `json:"timezone"`
-		Interests   []string     `json:"interests"`
-		MustInclude []string     `json:"must_include"`
-		Exclude     []string     `json:"exclude"`
-		Notes       string       `json:"notes"`
-		Items       []promptItem `json:"items"`
+		Now           string       `json:"now"`
+		Language      string       `json:"language"`
+		Timezone      string       `json:"timezone"`
+		Interests     []string     `json:"interests"`
+		MustInclude   []string     `json:"must_include"`
+		Exclude       []string     `json:"exclude"`
+		PriorityTerms []string     `json:"priority_terms,omitempty"`
+		Notes         string       `json:"notes"`
+		Items         []promptItem `json:"items"`
 	}{
-		Now:         time.Now().Format(time.RFC3339),
-		Language:    profile.Language,
-		Timezone:    profile.Timezone,
-		Interests:   profile.Interests,
-		MustInclude: profile.MustInclude,
-		Exclude:     profile.Exclude,
-		Notes:       profile.Notes,
+		Now:           time.Now().Format(time.RFC3339),
+		Language:      profile.Language,
+		Timezone:      profile.Timezone,
+		Interests:     profile.Interests,
+		MustInclude:   profile.MustInclude,
+		Exclude:       profile.Exclude,
+		PriorityTerms: profile.PriorityTerms,
+		Notes:         profile.Notes,
 	}
 	for _, item := range items {
 		p := promptItem{
-			ItemID:     item.StableID(),
-			Feed:       item.FeedName,
-			FeedTags:   item.FeedTags,
-			Title:      item.Title,
-			Link:       item.Link,
-			Author:     item.Author,
-			Categories: item.Categories,
-			Snippet:    item.Snippet(1200),
+			ItemID:       item.StableID(),
+			Feed:         item.FeedName,
+			FeedTags:     item.FeedTags,
+			Title:        item.Title,
+			Link:         item.Link,
+			Author:       item.Author,
+			Categories:   item.Categories,
+			Snippet:      item.Snippet(1200),
+			LocalScore:   item.LocalScore,
+			LocalReasons: item.LocalReasons,
 		}
 		if t := item.Time(); !t.IsZero() {
 			p.Published = t.Format(time.RFC3339)

@@ -8,6 +8,13 @@ profile:
     exclude:
         - 纯融资新闻
         - 标题党营销稿
+    priority_terms:
+        - Eino
+        - AI Agent
+        - Go
+        - LLM
+    muted_feeds: []
+    muted_tags: []
     notes: 偏好可落地、有技术细节、信息密度高的内容。
 models:
     primary:
@@ -44,6 +51,7 @@ settings:
     batch_size: 8
     min_score: 7
     max_pushes: 8
+    max_candidates_per_run: 24
     analysis_cache_ttl: 168h
 database:
     path: .rss-agent/rss-agent.db

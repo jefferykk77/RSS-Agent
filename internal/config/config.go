@@ -26,12 +26,15 @@ type Config struct {
 }
 
 type Profile struct {
-	Language    string   `yaml:"language"`
-	Timezone    string   `yaml:"timezone"`
-	Interests   []string `yaml:"interests"`
-	MustInclude []string `yaml:"must_include"`
-	Exclude     []string `yaml:"exclude"`
-	Notes       string   `yaml:"notes"`
+	Language      string   `yaml:"language"`
+	Timezone      string   `yaml:"timezone"`
+	Interests     []string `yaml:"interests"`
+	MustInclude   []string `yaml:"must_include"`
+	Exclude       []string `yaml:"exclude"`
+	PriorityTerms []string `yaml:"priority_terms"`
+	MutedFeeds    []string `yaml:"muted_feeds"`
+	MutedTags     []string `yaml:"muted_tags"`
+	Notes         string   `yaml:"notes"`
 }
 
 type Model struct {
@@ -56,14 +59,15 @@ type ModelPool struct {
 }
 
 type Settings struct {
-	Interval         string `yaml:"interval"`
-	HTTPTimeout      string `yaml:"http_timeout"`
-	LookbackHours    int    `yaml:"lookback_hours"`
-	MaxItemsPerFeed  int    `yaml:"max_items_per_feed"`
-	BatchSize        int    `yaml:"batch_size"`
-	MinScore         int    `yaml:"min_score"`
-	MaxPushes        int    `yaml:"max_pushes"`
-	AnalysisCacheTTL string `yaml:"analysis_cache_ttl"`
+	Interval            string `yaml:"interval"`
+	HTTPTimeout         string `yaml:"http_timeout"`
+	LookbackHours       int    `yaml:"lookback_hours"`
+	MaxItemsPerFeed     int    `yaml:"max_items_per_feed"`
+	BatchSize           int    `yaml:"batch_size"`
+	MinScore            int    `yaml:"min_score"`
+	MaxPushes           int    `yaml:"max_pushes"`
+	MaxCandidatesPerRun *int   `yaml:"max_candidates_per_run"`
+	AnalysisCacheTTL    string `yaml:"analysis_cache_ttl"`
 }
 
 type Database struct {
@@ -204,6 +208,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("feeds[%d].url 不能为空", i)
 		}
 	}
+	if c.Settings.MaxCandidatesPerRun != nil && *c.Settings.MaxCandidatesPerRun < 0 {
+		return errors.New("settings.max_candidates_per_run cannot be negative")
+	}
 	for _, model := range c.ModelCandidates() {
 		if model.Name == "" || isDisabled(model) {
 			continue
@@ -225,6 +232,13 @@ func (c *Config) HTTPTimeout() time.Duration {
 
 func (c *Config) AnalysisCacheTTL() time.Duration {
 	return mustDuration(c.Settings.AnalysisCacheTTL, 168*time.Hour)
+}
+
+func (s Settings) CandidateLimit() int {
+	if s.MaxCandidatesPerRun == nil {
+		return 24
+	}
+	return *s.MaxCandidatesPerRun
 }
 
 func (c *Config) DatabasePath() string {
@@ -447,6 +461,7 @@ func firstNonEmpty(values ...string) string {
 }
 
 func Sample() *Config {
+	candidateLimit := 24
 	cfg := &Config{
 		Profile: Profile{
 			Language: "zh-CN",
@@ -455,7 +470,10 @@ func Sample() *Config {
 				"AI Agent、Eino、Go 工程实践、LLM 应用架构",
 				"能直接启发产品设计或开发效率的工具、论文和案例",
 			},
-			MustInclude: []string{},
+			MustInclude:   []string{},
+			PriorityTerms: []string{"Eino", "AI Agent", "Go", "LLM"},
+			MutedFeeds:    []string{},
+			MutedTags:     []string{},
 			Exclude: []string{
 				"纯融资新闻",
 				"标题党营销稿",
@@ -491,14 +509,15 @@ func Sample() *Config {
 			},
 		},
 		Settings: Settings{
-			Interval:         "30m",
-			HTTPTimeout:      "20s",
-			LookbackHours:    72,
-			MaxItemsPerFeed:  20,
-			BatchSize:        8,
-			MinScore:         7,
-			MaxPushes:        8,
-			AnalysisCacheTTL: "168h",
+			Interval:            "30m",
+			HTTPTimeout:         "20s",
+			LookbackHours:       72,
+			MaxItemsPerFeed:     20,
+			BatchSize:           8,
+			MinScore:            7,
+			MaxPushes:           8,
+			MaxCandidatesPerRun: &candidateLimit,
+			AnalysisCacheTTL:    "168h",
 		},
 		Database: Database{Path: ".rss-agent/rss-agent.db"},
 		Budget: Budget{
