@@ -1,0 +1,69 @@
+profile:
+    language: zh-CN
+    timezone: Asia/Shanghai
+    interests:
+        - AI Agent、Eino、Go 工程实践、LLM 应用架构
+        - 能直接启发产品设计或开发效率的工具、论文和案例
+    must_include: []
+    exclude:
+        - 纯融资新闻
+        - 标题党营销稿
+    notes: 偏好可落地、有技术细节、信息密度高的内容。
+models:
+    primary:
+        label: ark-deepseek-v3.2
+        provider: ark
+        base_url: https://ark.cn-beijing.volces.com/api/v3
+        api_key: ""
+        api_key_env: ARK_API_KEY
+        name: ${ARK_MODEL}
+        timeout: 60s
+        temperature: 0.2
+        max_tokens: 1200
+        input_price_cny_per_million: 0
+        output_price_cny_per_million: 0
+        free_daily_tokens: 2000000
+    fallback:
+        - label: deepseek-v4-flash
+          provider: deepseek
+          base_url: https://api.deepseek.com
+          api_key: ""
+          api_key_env: DEEPSEEK_API_KEY
+          name: ${DEEPSEEK_MODEL}
+          timeout: 60s
+          temperature: 0.2
+          max_tokens: 1200
+          input_price_cny_per_million: 0.95
+          output_price_cny_per_million: 1.9
+          free_daily_tokens: 0
+settings:
+    interval: 30m
+    http_timeout: 20s
+    lookback_hours: 72
+    max_items_per_feed: 20
+    batch_size: 8
+    min_score: 7
+    max_pushes: 8
+    analysis_cache_ttl: 168h
+database:
+    path: .rss-agent/rss-agent.db
+budget:
+    monthly_cny: 20
+    llm_monthly_cny: 5
+    x_monthly_cny: 10
+    hard_stop_cny: 19
+    stop_when_free_quota_missing: false
+    warn_when_used_ratio: 0.8
+push:
+    console: true
+    webhook_url: ""
+    webhook_url_env: RSS_AGENT_WEBHOOK_URL
+feeds:
+    - name: CloudWeGo Blog
+      url: https://www.cloudwego.io/feed.xml
+      tags:
+        - go
+        - eino
+      disabled: false
+state:
+    path: .rss-agent/state.json
