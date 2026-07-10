@@ -7,22 +7,36 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultProfileName = "default"
+
 type Config struct {
-	Profile  Profile     `yaml:"profile"`
-	Model    Model       `yaml:"model,omitempty"`
-	Models   ModelPool   `yaml:"models,omitempty"`
-	Settings Settings    `yaml:"settings"`
-	Database Database    `yaml:"database"`
-	Budget   Budget      `yaml:"budget"`
-	Push     Push        `yaml:"push"`
-	Feeds    []Feed      `yaml:"feeds"`
-	State    StateConfig `yaml:"state,omitempty"`
+	Profile  Profile                  `yaml:"profile"`
+	Model    Model                    `yaml:"model,omitempty"`
+	Models   ModelPool                `yaml:"models,omitempty"`
+	Settings Settings                 `yaml:"settings"`
+	Database Database                 `yaml:"database"`
+	Budget   Budget                   `yaml:"budget"`
+	Push     Push                     `yaml:"push"`
+	Feeds    []Feed                   `yaml:"feeds"`
+	State    StateConfig              `yaml:"state,omitempty"`
+	Profiles map[string]ProfileConfig `yaml:"profiles,omitempty"`
+}
+
+type ProfileConfig struct {
+	Profile  Profile   `yaml:"profile"`
+	Model    Model     `yaml:"model,omitempty"`
+	Models   ModelPool `yaml:"models,omitempty"`
+	Settings Settings  `yaml:"settings,omitempty"`
+	Budget   Budget    `yaml:"budget,omitempty"`
+	Push     Push      `yaml:"push,omitempty"`
+	Feeds    []Feed    `yaml:"feeds,omitempty"`
 }
 
 type Profile struct {
@@ -205,6 +219,22 @@ func (c *Config) ApplyDefaults() {
 }
 
 func (c *Config) Validate() error {
+	if err := c.validateSingle(); err != nil {
+		return err
+	}
+	for name := range c.Profiles {
+		name = strings.TrimSpace(name)
+		if name == "" || name == DefaultProfileName {
+			return fmt.Errorf("profiles 中不能使用保留名称 %q", name)
+		}
+		if _, err := c.ResolveProfile(name); err != nil {
+			return fmt.Errorf("profiles.%s 无效：%w", name, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateSingle() error {
 	if len(c.Profile.Interests) == 0 {
 		return errors.New("profile.interests 至少需要一条兴趣描述")
 	}
@@ -234,6 +264,64 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) ProfileNames() []string {
+	names := make([]string, 0, len(c.Profiles)+1)
+	names = append(names, DefaultProfileName)
+	for name := range c.Profiles {
+		name = strings.TrimSpace(name)
+		if name != "" && name != DefaultProfileName {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names[1:])
+	return names
+}
+
+func (c *Config) ResolveProfile(name string) (*Config, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = DefaultProfileName
+	}
+	resolved := copyConfig(c)
+	resolved.Profiles = nil
+	if name != DefaultProfileName {
+		profile, ok := c.Profiles[name]
+		if !ok {
+			return nil, fmt.Errorf("未找到 profile %q；可用 profile：%s", name, strings.Join(c.ProfileNames(), ", "))
+		}
+		resolved.Profile = profile.Profile
+		resolved.Settings = profile.Settings
+		resolved.Budget = profile.Budget
+		resolved.Push = profile.Push
+		resolved.Feeds = append([]Feed(nil), profile.Feeds...)
+		if hasProfileModels(profile) {
+			resolved.Model = profile.Model
+			resolved.Models = copyModelPool(profile.Models)
+		}
+	}
+	resolved.ApplyDefaults()
+	if err := resolved.validateSingle(); err != nil {
+		return nil, err
+	}
+	return &resolved, nil
+}
+
+func copyConfig(c *Config) Config {
+	clone := *c
+	clone.Feeds = append([]Feed(nil), c.Feeds...)
+	clone.Models = copyModelPool(c.Models)
+	return clone
+}
+
+func copyModelPool(pool ModelPool) ModelPool {
+	pool.Fallback = append([]Model(nil), pool.Fallback...)
+	return pool
+}
+
+func hasProfileModels(profile ProfileConfig) bool {
+	return !isZeroModel(profile.Model) || !isZeroModel(profile.Models.Primary) || len(profile.Models.Fallback) > 0
 }
 
 func (c *Config) Interval() time.Duration {
@@ -549,6 +637,25 @@ func Sample() *Config {
 			WebhookURLEnv: "RSS_AGENT_WEBHOOK_URL",
 		},
 		State: StateConfig{Path: ".rss-agent/state.json"},
+		Profiles: map[string]ProfileConfig{
+			"product": {
+				Profile: Profile{
+					Language:      "zh-CN",
+					Timezone:      "Asia/Shanghai",
+					Interests:     []string{"AI 产品策略、开发者工具、产品增长与竞品动态"},
+					MustInclude:   []string{},
+					Exclude:       []string{"纯融资新闻", "标题党营销稿"},
+					PriorityTerms: []string{"AI", "Agent", "product", "developer tools"},
+					MutedFeeds:    []string{},
+					MutedTags:     []string{},
+					Notes:         "偏好产品方向、用户价值和可验证的市场信号。",
+				},
+				Push: Push{Console: true, WebhookURLEnv: "RSS_AGENT_WEBHOOK_URL"},
+				Feeds: []Feed{
+					{Name: "Go Blog", URL: "https://go.dev/blog/feed.atom", Tags: []string{"product", "developer-tools"}},
+				},
+			},
+		},
 		Feeds: []Feed{
 			{
 				Name: "Go Blog",

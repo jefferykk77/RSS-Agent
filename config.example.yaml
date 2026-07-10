@@ -77,3 +77,33 @@ feeds:
       disabled: false
 state:
     path: .rss-agent/state.json
+profiles:
+    product:
+        profile:
+            language: zh-CN
+            timezone: Asia/Shanghai
+            interests:
+                - AI 产品策略、开发者工具、产品增长与竞品动态
+            must_include: []
+            exclude:
+                - 纯融资新闻
+                - 标题党营销稿
+            priority_terms:
+                - AI
+                - Agent
+                - product
+                - developer tools
+            muted_feeds: []
+            muted_tags: []
+            notes: 偏好产品方向、用户价值和可验证的市场信号。
+        push:
+            console: true
+            webhook_url: ""
+            webhook_url_env: RSS_AGENT_WEBHOOK_URL
+        feeds:
+            - name: Go Blog
+              url: https://go.dev/blog/feed.atom
+              tags:
+                - product
+                - developer-tools
+              disabled: false

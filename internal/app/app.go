@@ -18,6 +18,7 @@ import (
 type RunOptions struct {
 	DryRun      bool
 	IncludeSeen bool
+	ProfileID   string
 }
 
 type RunSummary struct {
@@ -117,6 +118,9 @@ func fetchRunNode(ctx context.Context, state *runState) (*runState, error) {
 			if err := state.db.UpsertItem(ctx, item); err != nil {
 				return state, err
 			}
+			if err := state.db.UpsertProfileItem(ctx, state.options.ProfileID, item); err != nil {
+				return state, err
+			}
 		}
 	}
 	return state, nil
@@ -126,12 +130,12 @@ func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
 	seenIDs := map[string]bool{}
 	if !state.options.IncludeSeen {
 		var err error
-		seenIDs, err = state.db.SeenIDs(ctx)
+		seenIDs, err = state.db.SeenIDsForProfile(ctx, state.options.ProfileID)
 		if err != nil {
 			return state, err
 		}
 	}
-	feedback, err := state.db.FeedbackFilters(ctx)
+	feedback, err := state.db.FeedbackFiltersForProfile(ctx, state.options.ProfileID)
 	if err != nil {
 		return state, err
 	}
@@ -236,7 +240,7 @@ func pushRunNode(ctx context.Context, state *runState) (*runState, error) {
 		}
 	}
 	for _, item := range state.candidates {
-		if err := state.db.MarkSeen(ctx, item, pushed[item.StableID()]); err != nil {
+		if err := state.db.MarkSeenForProfile(ctx, state.options.ProfileID, item, pushed[item.StableID()]); err != nil {
 			return state, err
 		}
 	}
