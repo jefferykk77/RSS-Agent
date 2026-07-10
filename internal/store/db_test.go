@@ -188,6 +188,8 @@ func TestProfileScopedItemsSeenAndFeedback(t *testing.T) {
 		FeedURL:  "https://example.com/feed.xml",
 		Title:    "A useful post",
 		Link:     "https://example.com/post",
+		Summary:  "Useful source summary",
+		Content:  "Full article body",
 	}
 	item.ID = item.StableID()
 	if err := db.UpsertItem(ctx, item); err != nil {
@@ -239,5 +241,32 @@ func TestProfileScopedItemsSeenAndFeedback(t *testing.T) {
 	}
 	if len(defaultItems) != 1 || len(productItems) != 1 {
 		t.Fatalf("profile items = default:%+v product:%+v", defaultItems, productItems)
+	}
+
+	decision := agent.Decision{
+		ItemID:     item.ID,
+		Score:      9,
+		ShouldPush: true,
+		Title:      "Analyzed title",
+		Summary:    "Analyzed summary",
+		Why:        "Relevant to the product profile",
+		KeyPoints:  []string{"One useful point"},
+		Tags:       []string{"product"},
+	}
+	if err := db.SaveAnalysis(ctx, item, "product-profile", "test-model", "model-id", decision); err != nil {
+		t.Fatalf("SaveAnalysis() error = %v", err)
+	}
+	digest, err := db.DigestItemsForProfile(ctx, "product", "product-profile", 10)
+	if err != nil {
+		t.Fatalf("DigestItemsForProfile() error = %v", err)
+	}
+	if len(digest) != 1 {
+		t.Fatalf("digest = %+v, want one item", digest)
+	}
+	if digest[0].Score != 9 || digest[0].Summary != "Analyzed summary" || digest[0].Content != "Full article body" {
+		t.Fatalf("digest item = %+v", digest[0])
+	}
+	if len(digest[0].Feedback) != 1 || digest[0].Feedback[0] != FeedbackBlockFeed {
+		t.Fatalf("digest feedback = %+v", digest[0].Feedback)
 	}
 }

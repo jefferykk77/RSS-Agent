@@ -5,15 +5,18 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jeffery/rss-agent/internal/app"
 	"github.com/jeffery/rss-agent/internal/config"
 	"github.com/jeffery/rss-agent/internal/opml"
 	"github.com/jeffery/rss-agent/internal/store"
+	"github.com/jeffery/rss-agent/internal/web"
 )
 
 const defaultConfigPath = "config.yaml"
@@ -50,6 +53,8 @@ func run() error {
 		return runOnce(os.Args[2:])
 	case "watch":
 		return watch(os.Args[2:])
+	case "serve":
+		return serve(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -435,6 +440,45 @@ func watch(args []string) error {
 	return app.Watch(ctx, cfg, app.RunOptions{IncludeSeen: *includeSeen, ProfileID: profileID})
 }
 
+func serve(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	addr := fs.String("addr", "127.0.0.1:8787", "监听地址")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	base, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(base.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           web.New(base, db).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	ctx, stop := signalContext()
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	fmt.Printf("RSS Agent Web UI: http://%s\n", *addr)
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
@@ -465,6 +509,7 @@ func usage() {
   rss-agent review [-limit 20] [-config config.yaml] [-profile default]
   rss-agent once [-config config.yaml] [-profile default] [-dry-run] [-include-seen]
   rss-agent watch [-config config.yaml] [-profile default]
+  rss-agent serve [-config config.yaml] [-addr 127.0.0.1:8787]
 
 环境变量：
   ARK_API_KEY        火山方舟 API Key

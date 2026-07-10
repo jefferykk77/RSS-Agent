@@ -68,6 +68,31 @@ type RecentItem struct {
 	PublishedAt time.Time
 }
 
+type DigestItem struct {
+	ID            string
+	FeedName      string
+	FeedURL       string
+	Title         string
+	Link          string
+	Author        string
+	PublishedAt   time.Time
+	SourceSummary string
+	Content       string
+	ModelLabel    string
+	ModelName     string
+	Score         int
+	ShouldPush    bool
+	AnalysisTitle string
+	Summary       string
+	Why           string
+	KeyPoints     []string
+	Tags          []string
+	AnalyzedAt    time.Time
+	Seen          bool
+	Pushed        bool
+	Feedback      []FeedbackAction
+}
+
 func ParseFeedbackAction(raw string) (FeedbackAction, error) {
 	action := FeedbackAction(strings.ToLower(strings.TrimSpace(raw)))
 	if !action.Valid() {
@@ -818,6 +843,101 @@ func (db *DB) RecentItemsForProfile(ctx context.Context, profileID string, limit
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (db *DB) DigestItemsForProfile(ctx context.Context, profileID string, profileHash string, limit int) ([]DigestItem, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	profileID = normalizeProfileID(profileID)
+	rows, err := db.sql.QueryContext(ctx, `SELECT
+		i.id, i.feed_name, i.feed_url, COALESCE(i.title, ''), COALESCE(i.link, ''), COALESCE(i.author, ''),
+		COALESCE(i.published_at, ''), COALESCE(i.summary, ''), COALESCE(i.content, ''),
+		COALESCE(a.model_label, ''), COALESCE(a.model_name, ''), COALESCE(a.score, 0),
+		COALESCE(a.should_push, 0), COALESCE(a.title, ''), COALESCE(a.summary, ''), COALESCE(a.why, ''),
+		COALESCE(a.key_points_json, ''), COALESCE(a.tags_json, ''), COALESCE(a.updated_at, ''),
+		COALESCE(s.seen_at, ''), COALESCE(s.pushed, 0)
+		FROM profile_items p
+		JOIN items i ON i.id = p.item_id
+		LEFT JOIN item_analyses a ON a.item_id = i.id AND a.profile_hash = ? AND a.content_hash = i.content_hash
+		LEFT JOIN profile_seen_items s ON s.profile_id = p.profile_id AND s.item_id = p.item_id
+		WHERE p.profile_id = ?
+		ORDER BY CASE WHEN COALESCE(a.should_push, 0) = 1 THEN 0 ELSE 1 END, a.score DESC, p.added_at DESC
+		LIMIT ?`, profileHash, profileID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []DigestItem{}
+	for rows.Next() {
+		var (
+			item          DigestItem
+			publishedRaw  string
+			keyPointsJSON string
+			tagsJSON      string
+			analyzedRaw   string
+			seenRaw       string
+			shouldPush    int
+			pushed        int
+		)
+		if err := rows.Scan(
+			&item.ID,
+			&item.FeedName,
+			&item.FeedURL,
+			&item.Title,
+			&item.Link,
+			&item.Author,
+			&publishedRaw,
+			&item.SourceSummary,
+			&item.Content,
+			&item.ModelLabel,
+			&item.ModelName,
+			&item.Score,
+			&shouldPush,
+			&item.AnalysisTitle,
+			&item.Summary,
+			&item.Why,
+			&keyPointsJSON,
+			&tagsJSON,
+			&analyzedRaw,
+			&seenRaw,
+			&pushed,
+		); err != nil {
+			return nil, err
+		}
+		if keyPointsJSON != "" && json.Unmarshal([]byte(keyPointsJSON), &item.KeyPoints) != nil {
+			return nil, fmt.Errorf("decode key points for item %q", item.ID)
+		}
+		if tagsJSON != "" && json.Unmarshal([]byte(tagsJSON), &item.Tags) != nil {
+			return nil, fmt.Errorf("decode tags for item %q", item.ID)
+		}
+		item.PublishedAt = parseTime(publishedRaw)
+		item.AnalyzedAt = parseTime(analyzedRaw)
+		item.Seen = seenRaw != ""
+		item.Pushed = pushed != 0
+		item.ShouldPush = shouldPush != 0
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	feedback, err := db.ListFeedbackForProfile(ctx, profileID, "")
+	if err != nil {
+		return nil, err
+	}
+	byItem := make(map[string][]FeedbackAction, len(feedback))
+	for _, entry := range feedback {
+		byItem[entry.ItemID] = append(byItem[entry.ItemID], entry.Action)
+	}
+	for i := range items {
+		items[i].Feedback = byItem[items[i].ID]
+	}
+	return items, nil
 }
 
 func (db *DB) RecordCostEvent(ctx context.Context, event CostEvent) error {
