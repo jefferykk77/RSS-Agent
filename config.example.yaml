@@ -68,6 +68,28 @@ push:
     console: true
     webhook_url: ""
     webhook_url_env: RSS_AGENT_WEBHOOK_URL
+    feishu:
+        webhook_url: ""
+        webhook_url_env: FEISHU_WEBHOOK_URL
+    dingtalk:
+        webhook_url: ""
+        webhook_url_env: DINGTALK_WEBHOOK_URL
+    telegram:
+        bot_token: ""
+        bot_token_env: TELEGRAM_BOT_TOKEN
+        chat_id: ""
+        chat_id_env: TELEGRAM_CHAT_ID
+    email:
+        smtp_host: ""
+        smtp_port: 587
+        username: ""
+        username_env: RSS_AGENT_SMTP_USERNAME
+        password: ""
+        password_env: RSS_AGENT_SMTP_PASSWORD
+        from: ""
+        to: []
+        subject: RSS Agent Digest
+        start_tls: true
 feeds:
     - name: Go Blog
       url: https://go.dev/blog/feed.atom

@@ -215,34 +215,56 @@ func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
 func pushRunNode(ctx context.Context, state *runState) (*runState, error) {
 	sortResults(state.decisions)
 	selected := selectPushes(state.decisions, state.cfg.Settings.MinScore, state.cfg.Settings.MaxPushes)
-	state.summary.Pushed = len(selected)
 	if state.options.DryRun {
+		state.summary.Pushed = len(selected)
 		fmt.Print(push.FormatMarkdown(selected))
 		return state, nil
 	}
 
 	pusher := &push.Pusher{
-		Console:    state.cfg.Push.Console,
-		WebhookURL: state.cfg.WebhookURL(),
+		Console:            state.cfg.Push.Console,
+		WebhookURL:         state.cfg.WebhookURL(),
+		FeishuWebhookURL:   state.cfg.FeishuWebhookURL(),
+		DingTalkWebhookURL: state.cfg.DingTalkWebhookURL(),
+		TelegramBotToken:   state.cfg.TelegramBotToken(),
+		TelegramChatID:     state.cfg.TelegramChatID(),
+		Email: push.EmailConfig{
+			SMTPHost: state.cfg.Push.Email.SMTPHost,
+			SMTPPort: state.cfg.EmailSMTPPort(),
+			Username: state.cfg.EmailUsername(),
+			Password: state.cfg.EmailPassword(),
+			From:     state.cfg.Push.Email.From,
+			To:       state.cfg.Push.Email.To,
+			Subject:  state.cfg.Push.Email.Subject,
+			StartTLS: state.cfg.EmailStartTLS(),
+		},
 	}
-	if err := pusher.Push(ctx, selected); err != nil {
-		for _, result := range selected {
-			_ = state.db.RecordPush(ctx, result.Item.StableID(), "push", false, err.Error())
-		}
-		return state, err
-	}
-
+	deliveries, pushErr := pusher.Push(ctx, selected)
 	pushed := make(map[string]bool, len(selected))
-	for _, result := range selected {
-		pushed[result.Item.StableID()] = true
-		if err := state.db.RecordPush(ctx, result.Item.StableID(), "push", true, ""); err != nil {
-			return state, err
+	for _, delivery := range deliveries {
+		for _, result := range selected {
+			errText := ""
+			if delivery.Err != nil {
+				errText = delivery.Err.Error()
+			}
+			if err := state.db.RecordPush(ctx, result.Item.StableID(), delivery.Channel, delivery.Err == nil, errText); err != nil {
+				return state, err
+			}
+			if delivery.Err == nil {
+				pushed[result.Item.StableID()] = true
+			}
 		}
+	}
+	if len(pushed) > 0 {
+		state.summary.Pushed = len(selected)
 	}
 	for _, item := range state.candidates {
 		if err := state.db.MarkSeenForProfile(ctx, state.options.ProfileID, item, pushed[item.StableID()]); err != nil {
 			return state, err
 		}
+	}
+	if pushErr != nil {
+		return state, pushErr
 	}
 	return state, nil
 }
