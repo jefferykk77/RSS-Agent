@@ -53,6 +53,8 @@ settings:
     max_pushes: 8
     max_candidates_per_run: 24
     analysis_cache_ttl: 168h
+    full_text_min_chars: 600
+    full_text_max_chars: 8000
 database:
     path: .rss-agent/rss-agent.db
 budget:
@@ -67,8 +69,8 @@ push:
     webhook_url: ""
     webhook_url_env: RSS_AGENT_WEBHOOK_URL
 feeds:
-    - name: CloudWeGo Blog
-      url: https://www.cloudwego.io/feed.xml
+    - name: Go Blog
+      url: https://go.dev/blog/feed.atom
       tags:
         - go
         - eino

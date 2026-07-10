@@ -104,3 +104,73 @@ func TestDBRoundTrip(t *testing.T) {
 		t.Fatalf("tokens = %d, want 120", tokens)
 	}
 }
+
+func TestFeedbackRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "rss-agent.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	item := rss.Item{
+		FeedName: "Example",
+		FeedURL:  "https://example.com/feed.xml",
+		Title:    "A useful post",
+		Link:     "https://example.com/post",
+	}
+	item.ID = item.StableID()
+	if err := db.UpsertItem(ctx, item); err != nil {
+		t.Fatalf("UpsertItem() error = %v", err)
+	}
+	recent, err := db.RecentItems(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecentItems() error = %v", err)
+	}
+	if len(recent) != 1 || recent[0].ID != item.ID {
+		t.Fatalf("recent items = %+v", recent)
+	}
+
+	if _, err := db.RecordFeedback(ctx, item.ID, FeedbackLike); err != nil {
+		t.Fatalf("RecordFeedback(like) error = %v", err)
+	}
+	if _, err := db.RecordFeedback(ctx, item.ID, FeedbackDislike); err != nil {
+		t.Fatalf("RecordFeedback(dislike) error = %v", err)
+	}
+	likes, err := db.ListFeedback(ctx, FeedbackLike)
+	if err != nil {
+		t.Fatalf("ListFeedback(like) error = %v", err)
+	}
+	if len(likes) != 0 {
+		t.Fatalf("likes = %+v, want none after dislike", likes)
+	}
+
+	if _, err := db.RecordFeedback(ctx, item.ID, FeedbackBlockFeed); err != nil {
+		t.Fatalf("RecordFeedback(block-feed) error = %v", err)
+	}
+	filters, err := db.FeedbackFilters(ctx)
+	if err != nil {
+		t.Fatalf("FeedbackFilters() error = %v", err)
+	}
+	if !filters.BlockedItemIDs[item.ID] {
+		t.Fatal("disliked item should be blocked")
+	}
+	if !filters.BlockedFeedURLs[item.FeedURL] {
+		t.Fatal("blocked feed should be present")
+	}
+
+	removed, err := db.RemoveFeedback(ctx, item.ID, FeedbackBlockFeed)
+	if err != nil {
+		t.Fatalf("RemoveFeedback() error = %v", err)
+	}
+	if !removed {
+		t.Fatal("block-feed feedback should be removed")
+	}
+	filters, err = db.FeedbackFilters(ctx)
+	if err != nil {
+		t.Fatalf("FeedbackFilters() error = %v", err)
+	}
+	if filters.BlockedFeedURLs[item.FeedURL] {
+		t.Fatal("removed block-feed should no longer block the feed")
+	}
+}

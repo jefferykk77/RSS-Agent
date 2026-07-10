@@ -68,6 +68,8 @@ type Settings struct {
 	MaxPushes           int    `yaml:"max_pushes"`
 	MaxCandidatesPerRun *int   `yaml:"max_candidates_per_run"`
 	AnalysisCacheTTL    string `yaml:"analysis_cache_ttl"`
+	FullTextMinChars    int    `yaml:"full_text_min_chars"`
+	FullTextMaxChars    int    `yaml:"full_text_max_chars"`
 }
 
 type Database struct {
@@ -176,6 +178,12 @@ func (c *Config) ApplyDefaults() {
 	if c.Settings.AnalysisCacheTTL == "" {
 		c.Settings.AnalysisCacheTTL = "168h"
 	}
+	if c.Settings.FullTextMinChars == 0 {
+		c.Settings.FullTextMinChars = 600
+	}
+	if c.Settings.FullTextMaxChars == 0 {
+		c.Settings.FullTextMaxChars = 8000
+	}
 	if c.Database.Path == "" {
 		c.Database.Path = ".rss-agent/rss-agent.db"
 	}
@@ -210,6 +218,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Settings.MaxCandidatesPerRun != nil && *c.Settings.MaxCandidatesPerRun < 0 {
 		return errors.New("settings.max_candidates_per_run cannot be negative")
+	}
+	if c.Settings.FullTextMinChars < 0 || c.Settings.FullTextMaxChars < 0 {
+		return errors.New("settings.full_text_min_chars and settings.full_text_max_chars cannot be negative")
+	}
+	if c.Settings.FullTextMinChars > c.Settings.FullTextMaxChars {
+		return errors.New("settings.full_text_max_chars must be greater than or equal to full_text_min_chars")
 	}
 	for _, model := range c.ModelCandidates() {
 		if model.Name == "" || isDisabled(model) {
@@ -518,6 +532,8 @@ func Sample() *Config {
 			MaxPushes:           8,
 			MaxCandidatesPerRun: &candidateLimit,
 			AnalysisCacheTTL:    "168h",
+			FullTextMinChars:    600,
+			FullTextMaxChars:    8000,
 		},
 		Database: Database{Path: ".rss-agent/rss-agent.db"},
 		Budget: Budget{
@@ -535,8 +551,8 @@ func Sample() *Config {
 		State: StateConfig{Path: ".rss-agent/state.json"},
 		Feeds: []Feed{
 			{
-				Name: "CloudWeGo Blog",
-				URL:  "https://www.cloudwego.io/feed.xml",
+				Name: "Go Blog",
+				URL:  "https://go.dev/blog/feed.atom",
 				Tags: []string{"go", "eino"},
 			},
 		},

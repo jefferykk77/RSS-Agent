@@ -14,18 +14,24 @@ type Stats struct {
 	Seen            int
 	Stale           int
 	Muted           int
+	FeedbackBlocked int
 	Excluded        int
 	MissingRequired int
 	Capped          int
 }
 
 func (s Stats) Skipped() int {
-	return s.Duplicate + s.Seen + s.Stale + s.Muted + s.Excluded + s.MissingRequired + s.Capped
+	return s.Duplicate + s.Seen + s.Stale + s.Muted + s.FeedbackBlocked + s.Excluded + s.MissingRequired + s.Capped
 }
 
 type Result struct {
 	Items []rss.Item
 	Stats Stats
+}
+
+type FeedbackRules struct {
+	BlockedItemIDs  map[string]bool
+	BlockedFeedURLs map[string]bool
 }
 
 type scoredItem struct {
@@ -35,6 +41,11 @@ type scoredItem struct {
 
 // Filter removes deterministic non-candidates before the LLM sees them.
 func Filter(items []rss.Item, seenIDs map[string]bool, profile config.Profile, settings config.Settings, includeSeen bool, now time.Time) Result {
+	return FilterWithFeedback(items, seenIDs, FeedbackRules{}, profile, settings, includeSeen, now)
+}
+
+// FilterWithFeedback removes deterministic non-candidates and feedback-blocked content before the LLM sees it.
+func FilterWithFeedback(items []rss.Item, seenIDs map[string]bool, feedback FeedbackRules, profile config.Profile, settings config.Settings, includeSeen bool, now time.Time) Result {
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -52,6 +63,10 @@ func Filter(items []rss.Item, seenIDs map[string]bool, profile config.Profile, s
 			continue
 		}
 		seenThisRun[id] = true
+		if feedbackBlocked(item, feedback) {
+			result.Stats.FeedbackBlocked++
+			continue
+		}
 		if !includeSeen && seenIDs[id] {
 			result.Stats.Seen++
 			continue
@@ -94,6 +109,13 @@ func Filter(items []rss.Item, seenIDs map[string]bool, profile config.Profile, s
 		result.Items = append(result.Items, candidate.item)
 	}
 	return result
+}
+
+func feedbackBlocked(item rss.Item, feedback FeedbackRules) bool {
+	if feedback.BlockedItemIDs[item.StableID()] {
+		return true
+	}
+	return feedback.BlockedFeedURLs[item.FeedURL]
 }
 
 func score(item rss.Item, terms []string) (int, []string) {

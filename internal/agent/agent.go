@@ -56,6 +56,30 @@ type Usage struct {
 	OutputTokens int
 }
 
+var (
+	jsonArrayPattern = regexp.MustCompile(`(?s)\[.*\]`)
+	decisionFields   = map[string]struct{}{
+		"item_id":     {},
+		"score":       {},
+		"should_push": {},
+		"title":       {},
+		"summary":     {},
+		"why":         {},
+		"key_points":  {},
+		"tags":        {},
+	}
+	requiredDecisionFields = []string{
+		"item_id",
+		"score",
+		"should_push",
+		"title",
+		"summary",
+		"why",
+		"key_points",
+		"tags",
+	}
+)
+
 func New(ctx context.Context, modelCfg config.ResolvedModel) (*Agent, error) {
 	return NewPool(ctx, []config.ResolvedModel{modelCfg})
 }
@@ -154,12 +178,7 @@ func (a *Agent) analyzeBatch(ctx context.Context, profile config.Profile, items 
 	}
 	var lastErr error
 	for _, entry := range a.models {
-		resp, err := entry.model.Generate(ctx, messages)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		decisions, err := parseDecisions(resp.Content)
+		decisions, inputTokens, outputTokens, err := generateValidated(ctx, entry, messages, items)
 		if err != nil {
 			lastErr = err
 			continue
@@ -168,14 +187,49 @@ func (a *Agent) analyzeBatch(ctx context.Context, profile config.Profile, items 
 			Provider:     entry.config.Provider,
 			Model:        entry.config.Name,
 			ModelLabel:   entry.config.Label,
-			InputTokens:  estimateMessageTokens(messages),
-			OutputTokens: estimateTokens(resp.Content),
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
 		}, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("模型池为空")
 	}
 	return nil, Usage{}, lastErr
+}
+
+func generateValidated(ctx context.Context, entry modelEntry, messages []*schema.Message, items []rss.Item) ([]Decision, int, int, error) {
+	var (
+		lastErr      error
+		inputTokens  int
+		outputTokens int
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		attemptMessages := messages
+		if attempt == 1 {
+			attemptMessages = append(append([]*schema.Message(nil), messages...), schema.UserMessage(
+				"上一轮输出未通过 JSON schema 校验。请仅返回覆盖每个 item_id 的 JSON 数组，字段必须完全符合要求。",
+			))
+		}
+		inputTokens += estimateMessageTokens(attemptMessages)
+
+		resp, err := entry.model.Generate(ctx, attemptMessages)
+		if err != nil {
+			lastErr = fmt.Errorf("模型 %s 第 %d 次调用失败：%w", entry.config.Label, attempt+1, err)
+			continue
+		}
+		outputTokens += estimateTokens(resp.Content)
+
+		decisions, err := parseDecisions(resp.Content)
+		if err == nil {
+			err = validateBatchDecisions(decisions, items)
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("模型 %s 第 %d 次输出无效：%w", entry.config.Label, attempt+1, err)
+			continue
+		}
+		return decisions, inputTokens, outputTokens, nil
+	}
+	return nil, inputTokens, outputTokens, lastErr
 }
 
 func systemPrompt(language string) string {
@@ -190,6 +244,7 @@ func systemPrompt(language string) string {
 4. 用 %s 输出摘要和理由。
 5. 输入中的 local_score 和 local_reasons 是本地规则的弱信号；可据此解释相关性，但仍要独立判断，不可仅因它们而推送。
 6. 只返回严格 JSON，不要 Markdown，不要解释。
+7. 必须为输入中的每个 item_id 返回且仅返回一个对象；字段必须完整，不可增加字段；score 必须是 0-10 的整数。
 
 JSON 格式：
 [
@@ -270,19 +325,127 @@ func parseDecisions(content string) ([]Decision, error) {
 	raw = strings.TrimSuffix(raw, "```")
 	raw = strings.TrimSpace(raw)
 
-	var decisions []Decision
-	if err := json.Unmarshal([]byte(raw), &decisions); err == nil {
-		return decisions, nil
+	values, err := parseDecisionArray(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("模型返回了空的决策数组")
 	}
 
-	match := regexp.MustCompile(`(?s)\[.*\]`).FindString(raw)
+	decisions := make([]Decision, 0, len(values))
+	for index, value := range values {
+		decision, err := validateDecisionSchema(value)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 项不符合 JSON schema：%w", index+1, err)
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions, nil
+}
+
+func parseDecisionArray(raw string) ([]json.RawMessage, error) {
+	var values []json.RawMessage
+	if strings.HasPrefix(raw, "[") {
+		if err := json.Unmarshal([]byte(raw), &values); err == nil {
+			return values, nil
+		}
+	}
+
+	match := jsonArrayPattern.FindString(raw)
 	if match == "" {
 		return nil, fmt.Errorf("模型没有返回 JSON 数组：%s", trimForError(raw))
 	}
-	if err := json.Unmarshal([]byte(match), &decisions); err != nil {
+	if err := json.Unmarshal([]byte(match), &values); err != nil {
 		return nil, fmt.Errorf("解析模型 JSON 失败：%w; raw=%s", err, trimForError(raw))
 	}
-	return decisions, nil
+	return values, nil
+}
+
+func validateDecisionSchema(raw json.RawMessage) (Decision, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Decision{}, fmt.Errorf("必须是 JSON 对象：%w", err)
+	}
+	for _, field := range requiredDecisionFields {
+		if _, ok := fields[field]; !ok {
+			return Decision{}, fmt.Errorf("缺少字段 %q", field)
+		}
+	}
+	for field := range fields {
+		if _, ok := decisionFields[field]; !ok {
+			return Decision{}, fmt.Errorf("包含未知字段 %q", field)
+		}
+	}
+
+	if strings.TrimSpace(string(fields["should_push"])) != "true" && strings.TrimSpace(string(fields["should_push"])) != "false" {
+		return Decision{}, fmt.Errorf("字段 \"should_push\" 必须是布尔值")
+	}
+	if strings.TrimSpace(string(fields["score"])) == "null" {
+		return Decision{}, fmt.Errorf("字段 \"score\" 必须是整数")
+	}
+
+	var decision Decision
+	if err := json.Unmarshal(raw, &decision); err != nil {
+		return Decision{}, err
+	}
+	if decision.Score < 0 || decision.Score > 10 {
+		return Decision{}, fmt.Errorf("字段 \"score\" 必须在 0-10 之间")
+	}
+	for name, value := range map[string]string{
+		"item_id": decision.ItemID,
+		"title":   decision.Title,
+		"summary": decision.Summary,
+		"why":     decision.Why,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return Decision{}, fmt.Errorf("字段 %q 不能为空", name)
+		}
+	}
+	if err := validateStringList("key_points", fields["key_points"], decision.KeyPoints); err != nil {
+		return Decision{}, err
+	}
+	if err := validateStringList("tags", fields["tags"], decision.Tags); err != nil {
+		return Decision{}, err
+	}
+	return decision, nil
+}
+
+func validateStringList(name string, raw json.RawMessage, values []string) error {
+	if strings.TrimSpace(string(raw)) == "null" {
+		return fmt.Errorf("字段 %q 必须是字符串数组", name)
+	}
+	var decoded []string
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return fmt.Errorf("字段 %q 必须是字符串数组", name)
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("字段 %q 不能包含空字符串", name)
+		}
+	}
+	return nil
+}
+
+func validateBatchDecisions(decisions []Decision, items []rss.Item) error {
+	if len(decisions) != len(items) {
+		return fmt.Errorf("决策数量为 %d，输入条目数量为 %d", len(decisions), len(items))
+	}
+	expected := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		expected[item.StableID()] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(decisions))
+	for _, decision := range decisions {
+		if _, ok := expected[decision.ItemID]; !ok {
+			return fmt.Errorf("返回了未知 item_id %q", decision.ItemID)
+		}
+		if _, ok := seen[decision.ItemID]; ok {
+			return fmt.Errorf("重复返回 item_id %q", decision.ItemID)
+		}
+		seen[decision.ItemID] = struct{}{}
+	}
+	return nil
 }
 
 func trimForError(s string) string {

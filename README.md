@@ -1,37 +1,62 @@
 # RSS Agent
 
-一个用 Go + Eino 做的 RSS Agent：订阅 RSS，按你的兴趣筛选，调用 LLM 总结，只推值得看的内容。
+一个本地优先的 Go + Eino RSS Agent：抓取订阅源，先在本地筛选与去重，再调用你自己的 LLM 做评分和摘要，只推值得看的内容。
+
+项目使用 SQLite 保存状态、抓取缓存、分析结果和成本记录；模型通过 OpenAI 兼容接口接入，默认示例为火山方舟，可配置回退模型。
 
 ## 快速开始
 
-```bash
+生成本地配置：
+
+```powershell
 go run ./cmd/rss-agent init
 ```
 
-编辑 `config.yaml`：
+这会创建 `config.yaml`。该文件是本地运行配置，已被 Git 忽略；可参考仓库内的 `config.example.yaml`。
 
-- `profile.interests`：你在意什么。
-- `profile.exclude`：你不想看的内容。
-- `feeds`：RSS 订阅源。
-- `models.primary`：首选模型；`models.fallback`：首选故障时才使用的模型。
+在 `config.yaml` 中至少检查：
 
-设置模型环境变量：
+- `profile`：兴趣、排除项、优先词和静默来源。
+- `feeds`：订阅源及其标签。
+- `models.primary`：首选模型；`models.fallback`：首选模型调用失败时的回退模型。
+- `database.path`：SQLite 数据库位置，默认是 `.rss-agent/rss-agent.db`。
+- `settings.full_text_min_chars` 与 `settings.full_text_max_chars`：RSS 内容过短时抓取文章页正文的阈值和最大长度。
 
-```bash
+设置模型环境变量。火山方舟通常将已授权模型的推理接入点 ID 作为 `ARK_MODEL`：
+
+```powershell
 $env:ARK_API_KEY="你的火山方舟 API Key"
 $env:ARK_MODEL="你的火山方舟推理接入点 ID"
-# 可选：DEEPSEEK_API_KEY 和 DEEPSEEK_MODEL，用作低价熔断回退。
+
+# 可选：配置 DeepSeek 作为回退模型。
+$env:DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+$env:DEEPSEEK_MODEL="你的 DeepSeek 模型名"
 ```
 
-运行一次：
+先用一次只读运行验证完整链路：
 
-```bash
+```powershell
+go run ./cmd/rss-agent once -dry-run
+```
+
+`-dry-run` 不会写入 SQLite、更新抓取状态或发送 webhook，但候选条目仍会调用 LLM，因此会消耗模型侧额度。确认结果后执行常规运行：
+
+```powershell
 go run ./cmd/rss-agent once
 ```
 
-## 本地筛选与成本
+## 运行与状态
 
-模型调用前会先在本地去重、排除已读/过期/静默内容，再按优先词排序，并把每次模型候选限制为 24 条，减少不必要的 Token 消耗。规则写在 `profile` 和 `settings`：
+常规 `once` 和 `watch` 运行会在 `database.path` 指定的 SQLite 文件中保存：
+
+- RSS 源的 `ETag`、`Last-Modified` 和抓取状态。后续请求会使用条件请求，`304 Not Modified` 时不会重复解析内容。
+- RSS 条目、内容去重信息、已读状态和推送记录。
+- LLM 评分、摘要、理由和标签。相同文章在相同偏好配置下会命中 `analysis_cache_ttl` 分析缓存，避免重复调用模型。
+- 模型 token 用量和按模型价格换算的成本记录。
+
+若 RSS 提供的摘要和正文少于 `full_text_min_chars`（默认 600），Agent 会仅为通过本地筛选的候选文章抓取链接页的 HTML 正文。提取并清洗后的正文最多保留 `full_text_max_chars`（默认 8000）个字符，页面响应体限制为 2 MiB，抓取失败只会记录为警告。
+
+模型调用前会先去重、跳过已读、过期、静默和排除内容，再按优先词排序并受候选上限控制：
 
 ```yaml
 profile:
@@ -40,26 +65,106 @@ profile:
   muted_tags: [招聘, 营销]
 settings:
   max_candidates_per_run: 24 # 设为 0 表示不限制
+  analysis_cache_ttl: 168h
+  full_text_min_chars: 600
+  full_text_max_chars: 8000
 ```
 
-命令完成后会输出每类本地跳过数量；进入模型的条目会附带本地命中理由，供模型参考但不强制推送。
+偏好变化会改变缓存键，因此修改 `profile` 后文章会重新分析。
 
 定时运行：
 
-```bash
+```powershell
 go run ./cmd/rss-agent watch
 ```
 
+## Eino Graph
+
+每次运行由 Eino Graph 按以下节点顺序编排：
+
+```text
+fetch -> filter -> enrich -> analyze -> push
+```
+
+节点之间传递同一份运行状态，因此后续可在稳定节点边界上增加 tracing、回调、并行分支或人工确认，而不改变 RSS、缓存、模型和推送模块的职责。
+
+## 模型与预算
+
+每个模型可独立设置超时、温度、最大输出 token、价格与免费额度。`models.primary` 不可用时才尝试 `models.fallback`。
+
+每一批模型输出都会校验固定字段、JSON 类型、0-10 分数范围，以及是否恰好覆盖输入的每个 `item_id`。校验或调用失败时，先用同一模型自动重试一次，仍失败才切换回退模型。
+
+```yaml
+models:
+  primary:
+    provider: ark
+    api_key_env: ARK_API_KEY
+    name: ${ARK_MODEL}
+    input_price_cny_per_million: 0
+    output_price_cny_per_million: 0
+budget:
+  llm_monthly_cny: 5
+  hard_stop_cny: 19
+```
+
+在有未命中缓存的候选文章时，程序会先检查本月已记录的总成本和 LLM 成本；达到 `hard_stop_cny` 或 `llm_monthly_cny` 时停止新的模型调用。若要让成本估算生效，请按所用模型填写输入、输出价格。
+
 ## 订阅源管理
 
-```bash
-go run ./cmd/rss-agent add "CloudWeGo Blog" "https://www.cloudwego.io/feed.xml" -tag go -tag eino
+添加、查看订阅源：
+
+```powershell
+go run ./cmd/rss-agent add "Go Blog" "https://go.dev/blog/feed.atom" -tag go -tag engineering
 go run ./cmd/rss-agent list
+```
+
+导入或导出 OPML。导入会按 URL 自动跳过已有订阅源：
+
+```powershell
+go run ./cmd/rss-agent import-opml subscriptions.opml
+go run ./cmd/rss-agent export-opml feeds.opml
+```
+
+所有命令都支持 `-config` 指向另一份配置：
+
+```powershell
+go run ./cmd/rss-agent once -config .\work-config.yaml -dry-run
+```
+
+## 反馈与复盘
+
+先查看最近由常规 `once` 保存过的条目，复制对应的 `item_id`：
+
+```powershell
+go run ./cmd/rss-agent review
+```
+
+记录反馈：
+
+```powershell
+go run ./cmd/rss-agent feedback like <item-id>
+go run ./cmd/rss-agent feedback save <item-id>
+go run ./cmd/rss-agent feedback later <item-id>
+go run ./cmd/rss-agent feedback dislike <item-id>
+go run ./cmd/rss-agent feedback block <item-id>
+go run ./cmd/rss-agent feedback block-feed <item-id>
+```
+
+- `like`、`save`、`later` 会保存可复盘的状态。
+- `dislike` 和 `block` 会阻止该条目再次进入后续筛选与模型分析。
+- `block-feed` 会屏蔽同一 RSS 来源的未来文章。
+
+查看或撤销反馈：
+
+```powershell
+go run ./cmd/rss-agent feedback list
+go run ./cmd/rss-agent feedback list save
+go run ./cmd/rss-agent feedback remove block-feed <item-id>
 ```
 
 ## 推送
 
-默认会输出到控制台。如果设置 `RSS_AGENT_WEBHOOK_URL`，会同时 POST 一份 JSON：
+默认结果会输出到控制台。设置 `RSS_AGENT_WEBHOOK_URL` 后，程序也会发送以下 JSON 到 webhook：
 
 ```json
 {
@@ -68,8 +173,31 @@ go run ./cmd/rss-agent list
 }
 ```
 
-可以接到你自己的飞书/钉钉/Slack 转发服务。
+可将 webhook 接到自己的飞书、钉钉、Slack 或其他转发服务。
 
-## Eino 使用点
+## 命令速查
 
-核心筛选和总结逻辑在 `internal/agent`，使用 `github.com/cloudwego/eino-ext/components/model/openai` 创建 Eino `ChatModel`，再通过 `schema.Message` 把 RSS 条目批量交给模型评分、筛选和总结。
+```text
+rss-agent init [-config config.yaml]
+rss-agent add <name> <url> [-tag ai] [-tag go]
+rss-agent list [-config config.yaml]
+rss-agent import-opml <subscriptions.opml> [-config config.yaml]
+rss-agent export-opml <subscriptions.opml> [-config config.yaml]
+rss-agent review [-limit 20] [-config config.yaml]
+rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]
+rss-agent feedback list [action] [-config config.yaml]
+rss-agent feedback remove <action> <item-id> [-config config.yaml]
+rss-agent once [-config config.yaml] [-dry-run] [-include-seen]
+rss-agent watch [-config config.yaml]
+```
+
+运行 `go run ./cmd/rss-agent help` 查看 CLI 帮助。
+
+## 开发验证
+
+```powershell
+go test ./...
+go build ./cmd/rss-agent
+```
+
+核心 LLM 调用位于 `internal/agent`，通过 `github.com/cloudwego/eino-ext/components/model/openai` 创建 Eino `ChatModel`；调度、缓存、预算和推送流程位于 `internal/app`。

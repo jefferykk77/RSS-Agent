@@ -64,3 +64,22 @@ func TestFilterDoesNotMatchShortASCIITermsInsideWords(t *testing.T) {
 		t.Fatalf("result = %#v", got)
 	}
 }
+
+func TestFilterWithFeedbackBlocksItemsAndFeeds(t *testing.T) {
+	now := time.Now()
+	items := []rss.Item{
+		{ID: "blocked-item", FeedName: "A", FeedURL: "https://example.com/a", Title: "One", PublishedAt: now},
+		{ID: "blocked-feed", FeedName: "B", FeedURL: "https://example.com/b", Title: "Two", PublishedAt: now},
+		{ID: "candidate", FeedName: "C", FeedURL: "https://example.com/c", Title: "Three", PublishedAt: now},
+	}
+	result := FilterWithFeedback(items, nil, FeedbackRules{
+		BlockedItemIDs:  map[string]bool{"blocked-item": true},
+		BlockedFeedURLs: map[string]bool{"https://example.com/b": true},
+	}, config.Profile{}, config.Settings{LookbackHours: 72}, false, now)
+	if result.Stats.FeedbackBlocked != 2 {
+		t.Fatalf("feedback blocked = %d, want 2", result.Stats.FeedbackBlocked)
+	}
+	if len(result.Items) != 1 || result.Items[0].ID != "candidate" {
+		t.Fatalf("items = %+v, want only candidate", result.Items)
+	}
+}

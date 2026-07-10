@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jeffery/rss-agent/internal/agent"
@@ -29,6 +30,57 @@ type CostEvent struct {
 	OutputTokens int
 	CostCNY      float64
 	CreatedAt    time.Time
+}
+
+type FeedbackAction string
+
+const (
+	FeedbackLike      FeedbackAction = "like"
+	FeedbackDislike   FeedbackAction = "dislike"
+	FeedbackBlock     FeedbackAction = "block"
+	FeedbackSave      FeedbackAction = "save"
+	FeedbackLater     FeedbackAction = "later"
+	FeedbackBlockFeed FeedbackAction = "block-feed"
+)
+
+type Feedback struct {
+	ItemID      string
+	Action      FeedbackAction
+	TargetValue string
+	Title       string
+	Link        string
+	FeedName    string
+	CreatedAt   time.Time
+}
+
+type FeedbackFilters struct {
+	BlockedItemIDs  map[string]bool
+	BlockedFeedURLs map[string]bool
+}
+
+type RecentItem struct {
+	ID          string
+	Title       string
+	Link        string
+	FeedName    string
+	PublishedAt time.Time
+}
+
+func ParseFeedbackAction(raw string) (FeedbackAction, error) {
+	action := FeedbackAction(strings.ToLower(strings.TrimSpace(raw)))
+	if !action.Valid() {
+		return "", fmt.Errorf("不支持的反馈操作 %q", raw)
+	}
+	return action, nil
+}
+
+func (a FeedbackAction) Valid() bool {
+	switch a {
+	case FeedbackLike, FeedbackDislike, FeedbackBlock, FeedbackSave, FeedbackLater, FeedbackBlockFeed:
+		return true
+	default:
+		return false
+	}
 }
 
 func Open(path string) (*DB, error) {
@@ -142,6 +194,14 @@ func (db *DB) migrate() error {
 			pushed_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_push_records_item ON push_records(item_id)`,
+		`CREATE TABLE IF NOT EXISTS item_feedback (
+			item_id TEXT NOT NULL,
+			action TEXT NOT NULL CHECK (action IN ('like', 'dislike', 'block', 'save', 'later', 'block-feed')),
+			target_value TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (item_id, action)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_feedback_action_created ON item_feedback(action, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS cost_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			scope TEXT NOT NULL,
@@ -379,6 +439,152 @@ func (db *DB) RecordPush(ctx context.Context, itemID string, channel string, suc
 		VALUES (?, ?, ?, ?, ?)`,
 		itemID, channel, boolInt(success), errText, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+func (db *DB) RecordFeedback(ctx context.Context, itemID string, action FeedbackAction) (Feedback, error) {
+	if !action.Valid() {
+		return Feedback{}, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+
+	feedback := Feedback{ItemID: itemID, Action: action}
+	var feedURL string
+	err := db.sql.QueryRowContext(ctx, `SELECT title, link, feed_name, feed_url FROM items WHERE id = ?`, itemID).
+		Scan(&feedback.Title, &feedback.Link, &feedback.FeedName, &feedURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Feedback{}, fmt.Errorf("未找到条目 %q；请先用常规 once 运行保存条目", itemID)
+	}
+	if err != nil {
+		return Feedback{}, err
+	}
+
+	feedback.TargetValue = itemID
+	if action == FeedbackBlockFeed {
+		if strings.TrimSpace(feedURL) == "" {
+			return Feedback{}, fmt.Errorf("条目 %q 没有可屏蔽的订阅源", itemID)
+		}
+		feedback.TargetValue = feedURL
+	}
+	if action == FeedbackLike {
+		if _, err := db.sql.ExecContext(ctx, `DELETE FROM item_feedback WHERE item_id = ? AND action = ?`, itemID, FeedbackDislike); err != nil {
+			return Feedback{}, err
+		}
+	}
+	if action == FeedbackDislike {
+		if _, err := db.sql.ExecContext(ctx, `DELETE FROM item_feedback WHERE item_id = ? AND action = ?`, itemID, FeedbackLike); err != nil {
+			return Feedback{}, err
+		}
+	}
+
+	feedback.CreatedAt = time.Now().UTC()
+	_, err = db.sql.ExecContext(ctx, `INSERT INTO item_feedback (item_id, action, target_value, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(item_id, action) DO UPDATE SET
+			target_value = excluded.target_value,
+			created_at = excluded.created_at`,
+		feedback.ItemID,
+		feedback.Action,
+		feedback.TargetValue,
+		feedback.CreatedAt.Format(time.RFC3339Nano),
+	)
+	return feedback, err
+}
+
+func (db *DB) RemoveFeedback(ctx context.Context, itemID string, action FeedbackAction) (bool, error) {
+	if !action.Valid() {
+		return false, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+	result, err := db.sql.ExecContext(ctx, `DELETE FROM item_feedback WHERE item_id = ? AND action = ?`, itemID, action)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count > 0, err
+}
+
+func (db *DB) ListFeedback(ctx context.Context, action FeedbackAction) ([]Feedback, error) {
+	if action != "" && !action.Valid() {
+		return nil, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT f.item_id, f.action, f.target_value, f.created_at,
+		COALESCE(i.title, ''), COALESCE(i.link, ''), COALESCE(i.feed_name, '')
+		FROM item_feedback f
+		LEFT JOIN items i ON i.id = f.item_id
+		WHERE (? = '' OR f.action = ?)
+		ORDER BY f.created_at DESC`, action, action)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	feedback := []Feedback{}
+	for rows.Next() {
+		var (
+			entry      Feedback
+			createdRaw string
+		)
+		if err := rows.Scan(&entry.ItemID, &entry.Action, &entry.TargetValue, &createdRaw, &entry.Title, &entry.Link, &entry.FeedName); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = parseTime(createdRaw)
+		feedback = append(feedback, entry)
+	}
+	return feedback, rows.Err()
+}
+
+func (db *DB) FeedbackFilters(ctx context.Context) (FeedbackFilters, error) {
+	filters := FeedbackFilters{
+		BlockedItemIDs:  map[string]bool{},
+		BlockedFeedURLs: map[string]bool{},
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT item_id, action, target_value FROM item_feedback
+		WHERE action IN (?, ?, ?)`, FeedbackDislike, FeedbackBlock, FeedbackBlockFeed)
+	if err != nil {
+		return FeedbackFilters{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			itemID string
+			action FeedbackAction
+			target string
+		)
+		if err := rows.Scan(&itemID, &action, &target); err != nil {
+			return FeedbackFilters{}, err
+		}
+		switch action {
+		case FeedbackDislike, FeedbackBlock:
+			filters.BlockedItemIDs[itemID] = true
+		case FeedbackBlockFeed:
+			filters.BlockedFeedURLs[target] = true
+		}
+	}
+	return filters, rows.Err()
+}
+
+func (db *DB) RecentItems(ctx context.Context, limit int) ([]RecentItem, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, title, link, feed_name, published_at
+		FROM items ORDER BY updated_db_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []RecentItem{}
+	for rows.Next() {
+		var (
+			item         RecentItem
+			publishedRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.Title, &item.Link, &item.FeedName, &publishedRaw); err != nil {
+			return nil, err
+		}
+		item.PublishedAt = parseTime(publishedRaw)
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (db *DB) RecordCostEvent(ctx context.Context, event CostEvent) error {
