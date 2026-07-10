@@ -226,6 +226,23 @@ push:
 
 飞书使用机器人文本消息，钉钉使用 Markdown 消息，Telegram 使用 Bot API 的 Markdown 消息。邮件使用 SMTP；默认端口为 `587`，默认启用 STARTTLS。`webhook_url`、Telegram token 和 SMTP 密码都可以直接写入配置，但建议只使用对应的环境变量。
 
+## Web 工作台
+
+Web 工作台直接读取与 CLI 相同的 SQLite 数据库，提供订阅画像切换、Digest 筛选与搜索、文章详情、反馈记录和命令面板。默认仅监听本机回环地址：
+
+```powershell
+go run ./cmd/rss-agent serve
+# 打开 http://127.0.0.1:8787
+```
+
+指定其他端口：
+
+```powershell
+go run ./cmd/rss-agent serve -addr 127.0.0.1:8790
+```
+
+页面上的“立即运行”会调用与 `rss-agent once` 相同的真实抓取、分析和推送流程，可能产生模型费用；仅在确认配置和预算后使用。
+
 ## 命令速查
 
 ```text
@@ -240,6 +257,7 @@ rss-agent feedback list [action] [-config config.yaml] [-profile default]
 rss-agent feedback remove <action> <item-id> [-config config.yaml] [-profile default]
 rss-agent once [-config config.yaml] [-profile default] [-dry-run] [-include-seen]
 rss-agent watch [-config config.yaml] [-profile default]
+rss-agent serve [-config config.yaml] [-addr 127.0.0.1:8787]
 ```
 
 运行 `go run ./cmd/rss-agent help` 查看 CLI 帮助。
