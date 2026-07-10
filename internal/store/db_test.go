@@ -174,3 +174,70 @@ func TestFeedbackRoundTrip(t *testing.T) {
 		t.Fatal("removed block-feed should no longer block the feed")
 	}
 }
+
+func TestProfileScopedItemsSeenAndFeedback(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "rss-agent.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	item := rss.Item{
+		FeedName: "Example",
+		FeedURL:  "https://example.com/feed.xml",
+		Title:    "A useful post",
+		Link:     "https://example.com/post",
+	}
+	item.ID = item.StableID()
+	if err := db.UpsertItem(ctx, item); err != nil {
+		t.Fatalf("UpsertItem() error = %v", err)
+	}
+	for _, profileID := range []string{"default", "product"} {
+		if err := db.UpsertProfileItem(ctx, profileID, item); err != nil {
+			t.Fatalf("UpsertProfileItem(%s) error = %v", profileID, err)
+		}
+	}
+
+	if err := db.MarkSeenForProfile(ctx, "default", item, true); err != nil {
+		t.Fatalf("MarkSeenForProfile() error = %v", err)
+	}
+	defaultSeen, err := db.SeenIDsForProfile(ctx, "default")
+	if err != nil {
+		t.Fatalf("SeenIDsForProfile(default) error = %v", err)
+	}
+	productSeen, err := db.SeenIDsForProfile(ctx, "product")
+	if err != nil {
+		t.Fatalf("SeenIDsForProfile(product) error = %v", err)
+	}
+	if !defaultSeen[item.ID] || productSeen[item.ID] {
+		t.Fatalf("seen isolation failed: default=%v product=%v", defaultSeen, productSeen)
+	}
+
+	if _, err := db.RecordFeedbackForProfile(ctx, "product", item.ID, FeedbackBlockFeed); err != nil {
+		t.Fatalf("RecordFeedbackForProfile() error = %v", err)
+	}
+	defaultFilters, err := db.FeedbackFiltersForProfile(ctx, "default")
+	if err != nil {
+		t.Fatalf("FeedbackFiltersForProfile(default) error = %v", err)
+	}
+	productFilters, err := db.FeedbackFiltersForProfile(ctx, "product")
+	if err != nil {
+		t.Fatalf("FeedbackFiltersForProfile(product) error = %v", err)
+	}
+	if defaultFilters.BlockedFeedURLs[item.FeedURL] || !productFilters.BlockedFeedURLs[item.FeedURL] {
+		t.Fatalf("feedback isolation failed: default=%v product=%v", defaultFilters, productFilters)
+	}
+
+	defaultItems, err := db.RecentItemsForProfile(ctx, "default", 10)
+	if err != nil {
+		t.Fatalf("RecentItemsForProfile(default) error = %v", err)
+	}
+	productItems, err := db.RecentItemsForProfile(ctx, "product", 10)
+	if err != nil {
+		t.Fatalf("RecentItemsForProfile(product) error = %v", err)
+	}
+	if len(defaultItems) != 1 || len(productItems) != 1 {
+		t.Fatalf("profile items = default:%+v product:%+v", defaultItems, productItems)
+	}
+}

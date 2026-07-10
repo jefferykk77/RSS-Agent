@@ -78,6 +78,33 @@ settings:
 go run ./cmd/rss-agent watch
 ```
 
+## 多 Profile
+
+根级配置是 `default` profile。可在 `profiles` 中定义独立的兴趣、订阅、设置、预算、推送与可选模型池；所有 profile 共享同一 SQLite 文件，但条目归属、已读状态和反馈记录彼此隔离。
+
+```yaml
+profiles:
+  product:
+    profile:
+      interests: [AI 产品策略, 开发者工具, 产品增长]
+      priority_terms: [AI, Agent, product]
+    feeds:
+      - name: Go Blog
+        url: https://go.dev/blog/feed.atom
+        tags: [product, developer-tools]
+    push:
+      console: true
+```
+
+profile 未设置 `models` 时会沿用根级模型池；设置后可使用独立的 `models.primary` 和 `models.fallback`。通过 `-profile` 选择运行上下文：
+
+```powershell
+go run ./cmd/rss-agent once -profile product
+go run ./cmd/rss-agent review -profile product
+go run ./cmd/rss-agent feedback list -profile product
+go run ./cmd/rss-agent add -profile product -tag product "Product Hunt" "https://www.producthunt.com/feed"
+```
+
 ## Eino Graph
 
 每次运行由 Eino Graph 按以下节点顺序编排：
@@ -114,15 +141,15 @@ budget:
 添加、查看订阅源：
 
 ```powershell
-go run ./cmd/rss-agent add "Go Blog" "https://go.dev/blog/feed.atom" -tag go -tag engineering
-go run ./cmd/rss-agent list
+go run ./cmd/rss-agent add -profile default -tag go -tag engineering "Go Blog" "https://go.dev/blog/feed.atom"
+go run ./cmd/rss-agent list -profile default
 ```
 
 导入或导出 OPML。导入会按 URL 自动跳过已有订阅源：
 
 ```powershell
-go run ./cmd/rss-agent import-opml subscriptions.opml
-go run ./cmd/rss-agent export-opml feeds.opml
+go run ./cmd/rss-agent import-opml -profile default subscriptions.opml
+go run ./cmd/rss-agent export-opml -profile default feeds.opml
 ```
 
 所有命令都支持 `-config` 指向另一份配置：
@@ -136,18 +163,18 @@ go run ./cmd/rss-agent once -config .\work-config.yaml -dry-run
 先查看最近由常规 `once` 保存过的条目，复制对应的 `item_id`：
 
 ```powershell
-go run ./cmd/rss-agent review
+go run ./cmd/rss-agent review -profile default
 ```
 
 记录反馈：
 
 ```powershell
-go run ./cmd/rss-agent feedback like <item-id>
-go run ./cmd/rss-agent feedback save <item-id>
-go run ./cmd/rss-agent feedback later <item-id>
-go run ./cmd/rss-agent feedback dislike <item-id>
-go run ./cmd/rss-agent feedback block <item-id>
-go run ./cmd/rss-agent feedback block-feed <item-id>
+go run ./cmd/rss-agent feedback like <item-id> -profile default
+go run ./cmd/rss-agent feedback save <item-id> -profile default
+go run ./cmd/rss-agent feedback later <item-id> -profile default
+go run ./cmd/rss-agent feedback dislike <item-id> -profile default
+go run ./cmd/rss-agent feedback block <item-id> -profile default
+go run ./cmd/rss-agent feedback block-feed <item-id> -profile default
 ```
 
 - `like`、`save`、`later` 会保存可复盘的状态。
@@ -157,9 +184,9 @@ go run ./cmd/rss-agent feedback block-feed <item-id>
 查看或撤销反馈：
 
 ```powershell
-go run ./cmd/rss-agent feedback list
-go run ./cmd/rss-agent feedback list save
-go run ./cmd/rss-agent feedback remove block-feed <item-id>
+go run ./cmd/rss-agent feedback list -profile default
+go run ./cmd/rss-agent feedback list save -profile default
+go run ./cmd/rss-agent feedback remove block-feed <item-id> -profile default
 ```
 
 ## 推送
@@ -179,16 +206,16 @@ go run ./cmd/rss-agent feedback remove block-feed <item-id>
 
 ```text
 rss-agent init [-config config.yaml]
-rss-agent add <name> <url> [-tag ai] [-tag go]
-rss-agent list [-config config.yaml]
-rss-agent import-opml <subscriptions.opml> [-config config.yaml]
-rss-agent export-opml <subscriptions.opml> [-config config.yaml]
-rss-agent review [-limit 20] [-config config.yaml]
-rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]
-rss-agent feedback list [action] [-config config.yaml]
-rss-agent feedback remove <action> <item-id> [-config config.yaml]
-rss-agent once [-config config.yaml] [-dry-run] [-include-seen]
-rss-agent watch [-config config.yaml]
+rss-agent add [-config config.yaml] [-profile default] [-tag ai] [-tag go] <name> <url>
+rss-agent list [-config config.yaml] [-profile default]
+rss-agent import-opml [-config config.yaml] [-profile default] <subscriptions.opml>
+rss-agent export-opml [-config config.yaml] [-profile default] <subscriptions.opml>
+rss-agent review [-limit 20] [-config config.yaml] [-profile default]
+rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml] [-profile default]
+rss-agent feedback list [action] [-config config.yaml] [-profile default]
+rss-agent feedback remove <action> <item-id> [-config config.yaml] [-profile default]
+rss-agent once [-config config.yaml] [-profile default] [-dry-run] [-include-seen]
+rss-agent watch [-config config.yaml] [-profile default]
 ```
 
 运行 `go run ./cmd/rss-agent help` 查看 CLI 帮助。

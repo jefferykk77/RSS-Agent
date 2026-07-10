@@ -20,6 +20,8 @@ type DB struct {
 	sql *sql.DB
 }
 
+const defaultProfileID = "default"
+
 type CostEvent struct {
 	Scope        string
 	Provider     string
@@ -159,6 +161,13 @@ func (db *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_items_feed_url ON items(feed_url)`,
 		`CREATE INDEX IF NOT EXISTS idx_items_content_hash ON items(content_hash)`,
+		`CREATE TABLE IF NOT EXISTS profile_items (
+			profile_id TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			added_at TEXT NOT NULL,
+			PRIMARY KEY (profile_id, item_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_items_recent ON profile_items(profile_id, added_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS seen_items (
 			item_id TEXT PRIMARY KEY,
 			title TEXT,
@@ -166,6 +175,13 @@ func (db *DB) migrate() error {
 			feed_name TEXT,
 			seen_at TEXT NOT NULL,
 			pushed INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS profile_seen_items (
+			profile_id TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			seen_at TEXT NOT NULL,
+			pushed INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (profile_id, item_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS item_analyses (
 			item_id TEXT NOT NULL,
@@ -202,6 +218,15 @@ func (db *DB) migrate() error {
 			PRIMARY KEY (item_id, action)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_item_feedback_action_created ON item_feedback(action, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS profile_feedback (
+			profile_id TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			action TEXT NOT NULL CHECK (action IN ('like', 'dislike', 'block', 'save', 'later', 'block-feed')),
+			target_value TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (profile_id, item_id, action)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_feedback_action_created ON profile_feedback(profile_id, action, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS cost_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			scope TEXT NOT NULL,
@@ -218,6 +243,19 @@ func (db *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_cost_events_model_created ON cost_events(provider, model, created_at)`,
 	}
 	for _, stmt := range stmts {
+		if _, err := db.sql.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	legacyMigrations := []string{
+		`INSERT OR IGNORE INTO profile_items (profile_id, item_id, added_at)
+			SELECT 'default', id, updated_db_at FROM items`,
+		`INSERT OR IGNORE INTO profile_seen_items (profile_id, item_id, seen_at, pushed)
+			SELECT 'default', item_id, seen_at, pushed FROM seen_items`,
+		`INSERT OR IGNORE INTO profile_feedback (profile_id, item_id, action, target_value, created_at)
+			SELECT 'default', item_id, action, target_value, created_at FROM item_feedback`,
+	}
+	for _, stmt := range legacyMigrations {
 		if _, err := db.sql.Exec(stmt); err != nil {
 			return err
 		}
@@ -313,8 +351,37 @@ func (db *DB) UpsertItem(ctx context.Context, item rss.Item) error {
 	return err
 }
 
+func (db *DB) UpsertProfileItem(ctx context.Context, profileID string, item rss.Item) error {
+	profileID = normalizeProfileID(profileID)
+	_, err := db.sql.ExecContext(ctx, `INSERT INTO profile_items (profile_id, item_id, added_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(profile_id, item_id) DO UPDATE SET added_at = excluded.added_at`,
+		profileID,
+		item.StableID(),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
 func (db *DB) SeenIDs(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.sql.QueryContext(ctx, `SELECT item_id FROM seen_items`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
+func (db *DB) SeenIDsForProfile(ctx context.Context, profileID string) (map[string]bool, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT item_id FROM profile_seen_items WHERE profile_id = ?`, normalizeProfileID(profileID))
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +420,21 @@ func (db *DB) MarkSeen(ctx context.Context, item rss.Item, pushed bool) error {
 		item.Title,
 		item.Link,
 		item.FeedName,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		boolInt(pushed),
+	)
+	return err
+}
+
+func (db *DB) MarkSeenForProfile(ctx context.Context, profileID string, item rss.Item, pushed bool) error {
+	_, err := db.sql.ExecContext(ctx, `INSERT INTO profile_seen_items
+		(profile_id, item_id, seen_at, pushed)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(profile_id, item_id) DO UPDATE SET
+			seen_at = excluded.seen_at,
+			pushed = excluded.pushed`,
+		normalizeProfileID(profileID),
+		item.StableID(),
 		time.Now().UTC().Format(time.RFC3339Nano),
 		boolInt(pushed),
 	)
@@ -489,11 +571,75 @@ func (db *DB) RecordFeedback(ctx context.Context, itemID string, action Feedback
 	return feedback, err
 }
 
+func (db *DB) RecordFeedbackForProfile(ctx context.Context, profileID string, itemID string, action FeedbackAction) (Feedback, error) {
+	if !action.Valid() {
+		return Feedback{}, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+	profileID = normalizeProfileID(profileID)
+
+	feedback := Feedback{ItemID: itemID, Action: action}
+	var feedURL string
+	err := db.sql.QueryRowContext(ctx, `SELECT i.title, i.link, i.feed_name, i.feed_url
+		FROM profile_items p JOIN items i ON i.id = p.item_id
+		WHERE p.profile_id = ? AND p.item_id = ?`, profileID, itemID).
+		Scan(&feedback.Title, &feedback.Link, &feedback.FeedName, &feedURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Feedback{}, fmt.Errorf("profile %q 未找到条目 %q；请先运行一次不带 -dry-run 的 once", profileID, itemID)
+	}
+	if err != nil {
+		return Feedback{}, err
+	}
+
+	feedback.TargetValue = itemID
+	if action == FeedbackBlockFeed {
+		if strings.TrimSpace(feedURL) == "" {
+			return Feedback{}, fmt.Errorf("条目 %q 没有可屏蔽的订阅源", itemID)
+		}
+		feedback.TargetValue = feedURL
+	}
+	if action == FeedbackLike {
+		if _, err := db.sql.ExecContext(ctx, `DELETE FROM profile_feedback WHERE profile_id = ? AND item_id = ? AND action = ?`, profileID, itemID, FeedbackDislike); err != nil {
+			return Feedback{}, err
+		}
+	}
+	if action == FeedbackDislike {
+		if _, err := db.sql.ExecContext(ctx, `DELETE FROM profile_feedback WHERE profile_id = ? AND item_id = ? AND action = ?`, profileID, itemID, FeedbackLike); err != nil {
+			return Feedback{}, err
+		}
+	}
+
+	feedback.CreatedAt = time.Now().UTC()
+	_, err = db.sql.ExecContext(ctx, `INSERT INTO profile_feedback (profile_id, item_id, action, target_value, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(profile_id, item_id, action) DO UPDATE SET
+			target_value = excluded.target_value,
+			created_at = excluded.created_at`,
+		profileID,
+		feedback.ItemID,
+		feedback.Action,
+		feedback.TargetValue,
+		feedback.CreatedAt.Format(time.RFC3339Nano),
+	)
+	return feedback, err
+}
+
 func (db *DB) RemoveFeedback(ctx context.Context, itemID string, action FeedbackAction) (bool, error) {
 	if !action.Valid() {
 		return false, fmt.Errorf("不支持的反馈操作 %q", action)
 	}
 	result, err := db.sql.ExecContext(ctx, `DELETE FROM item_feedback WHERE item_id = ? AND action = ?`, itemID, action)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count > 0, err
+}
+
+func (db *DB) RemoveFeedbackForProfile(ctx context.Context, profileID string, itemID string, action FeedbackAction) (bool, error) {
+	if !action.Valid() {
+		return false, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+	result, err := db.sql.ExecContext(ctx, `DELETE FROM profile_feedback WHERE profile_id = ? AND item_id = ? AND action = ?`, normalizeProfileID(profileID), itemID, action)
 	if err != nil {
 		return false, err
 	}
@@ -511,6 +657,36 @@ func (db *DB) ListFeedback(ctx context.Context, action FeedbackAction) ([]Feedba
 		LEFT JOIN items i ON i.id = f.item_id
 		WHERE (? = '' OR f.action = ?)
 		ORDER BY f.created_at DESC`, action, action)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	feedback := []Feedback{}
+	for rows.Next() {
+		var (
+			entry      Feedback
+			createdRaw string
+		)
+		if err := rows.Scan(&entry.ItemID, &entry.Action, &entry.TargetValue, &createdRaw, &entry.Title, &entry.Link, &entry.FeedName); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = parseTime(createdRaw)
+		feedback = append(feedback, entry)
+	}
+	return feedback, rows.Err()
+}
+
+func (db *DB) ListFeedbackForProfile(ctx context.Context, profileID string, action FeedbackAction) ([]Feedback, error) {
+	if action != "" && !action.Valid() {
+		return nil, fmt.Errorf("不支持的反馈操作 %q", action)
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT f.item_id, f.action, f.target_value, f.created_at,
+		COALESCE(i.title, ''), COALESCE(i.link, ''), COALESCE(i.feed_name, '')
+		FROM profile_feedback f
+		LEFT JOIN items i ON i.id = f.item_id
+		WHERE f.profile_id = ? AND (? = '' OR f.action = ?)
+		ORDER BY f.created_at DESC`, normalizeProfileID(profileID), action, action)
 	if err != nil {
 		return nil, err
 	}
@@ -561,12 +737,69 @@ func (db *DB) FeedbackFilters(ctx context.Context) (FeedbackFilters, error) {
 	return filters, rows.Err()
 }
 
+func (db *DB) FeedbackFiltersForProfile(ctx context.Context, profileID string) (FeedbackFilters, error) {
+	filters := FeedbackFilters{
+		BlockedItemIDs:  map[string]bool{},
+		BlockedFeedURLs: map[string]bool{},
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT item_id, action, target_value FROM profile_feedback
+		WHERE profile_id = ? AND action IN (?, ?, ?)`, normalizeProfileID(profileID), FeedbackDislike, FeedbackBlock, FeedbackBlockFeed)
+	if err != nil {
+		return FeedbackFilters{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			itemID string
+			action FeedbackAction
+			target string
+		)
+		if err := rows.Scan(&itemID, &action, &target); err != nil {
+			return FeedbackFilters{}, err
+		}
+		switch action {
+		case FeedbackDislike, FeedbackBlock:
+			filters.BlockedItemIDs[itemID] = true
+		case FeedbackBlockFeed:
+			filters.BlockedFeedURLs[target] = true
+		}
+	}
+	return filters, rows.Err()
+}
+
 func (db *DB) RecentItems(ctx context.Context, limit int) ([]RecentItem, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	rows, err := db.sql.QueryContext(ctx, `SELECT id, title, link, feed_name, published_at
 		FROM items ORDER BY updated_db_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []RecentItem{}
+	for rows.Next() {
+		var (
+			item         RecentItem
+			publishedRaw string
+		)
+		if err := rows.Scan(&item.ID, &item.Title, &item.Link, &item.FeedName, &publishedRaw); err != nil {
+			return nil, err
+		}
+		item.PublishedAt = parseTime(publishedRaw)
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (db *DB) RecentItemsForProfile(ctx context.Context, profileID string, limit int) ([]RecentItem, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT i.id, i.title, i.link, i.feed_name, i.published_at
+		FROM profile_items p JOIN items i ON i.id = p.item_id
+		WHERE p.profile_id = ? ORDER BY p.added_at DESC LIMIT ?`, normalizeProfileID(profileID), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -670,6 +903,14 @@ func parseTime(raw string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+func normalizeProfileID(profileID string) string {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" {
+		return defaultProfileID
+	}
+	return profileID
 }
 
 func debugSQL(err error, query string) error {

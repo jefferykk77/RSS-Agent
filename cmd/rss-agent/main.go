@@ -75,16 +75,48 @@ func initConfig(args []string) error {
 	return nil
 }
 
+func loadConfigProfile(configPath string, profileName string) (*config.Config, *config.Config, string, error) {
+	base, err := config.Load(configPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	profileID := strings.TrimSpace(profileName)
+	if profileID == "" {
+		profileID = config.DefaultProfileName
+	}
+	resolved, err := base.ResolveProfile(profileID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return base, resolved, profileID, nil
+}
+
+func saveProfileFeeds(cfg *config.Config, profileID string, feeds []config.Feed) error {
+	feeds = append([]config.Feed(nil), feeds...)
+	if profileID == config.DefaultProfileName {
+		cfg.Feeds = feeds
+		return nil
+	}
+	profile, ok := cfg.Profiles[profileID]
+	if !ok {
+		return fmt.Errorf("未找到 profile %q", profileID)
+	}
+	profile.Feeds = feeds
+	cfg.Profiles[profileID] = profile
+	return nil
+}
+
 func importOPML(args []string) error {
 	fs := flag.NewFlagSet("import-opml", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
 		return fmt.Errorf("用法：rss-agent import-opml <subscriptions.opml> [-config config.yaml]")
 	}
-	cfg, err := config.Load(*configPath)
+	base, cfg, profileID, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -105,7 +137,10 @@ func importOPML(args []string) error {
 		existing[feed.URL] = true
 		added++
 	}
-	if err := config.Save(*configPath, cfg); err != nil {
+	if err := saveProfileFeeds(base, profileID, cfg.Feeds); err != nil {
+		return err
+	}
+	if err := config.Save(*configPath, base); err != nil {
 		return err
 	}
 	fmt.Printf("已从 OPML 导入 %d 个新订阅源。\n", added)
@@ -115,13 +150,14 @@ func importOPML(args []string) error {
 func exportOPML(args []string) error {
 	fs := flag.NewFlagSet("export-opml", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
 		return fmt.Errorf("用法：rss-agent export-opml <subscriptions.opml> [-config config.yaml]")
 	}
-	cfg, err := config.Load(*configPath)
+	_, cfg, _, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -135,6 +171,7 @@ func exportOPML(args []string) error {
 func addFeed(args []string) error {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	tags := multiFlag{}
 	disabled := fs.Bool("disabled", false, "添加后先禁用")
 	fs.Var(&tags, "tag", "订阅源标签，可重复")
@@ -144,7 +181,7 @@ func addFeed(args []string) error {
 	if fs.NArg() < 2 {
 		return fmt.Errorf("用法：rss-agent add <name> <url> [-tag ai] [-tag go]")
 	}
-	cfg, err := config.Load(*configPath)
+	base, cfg, profileID, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -154,7 +191,10 @@ func addFeed(args []string) error {
 		Tags:     []string(tags),
 		Disabled: *disabled,
 	})
-	if err := config.Save(*configPath, cfg); err != nil {
+	if err := saveProfileFeeds(base, profileID, cfg.Feeds); err != nil {
+		return err
+	}
+	if err := config.Save(*configPath, base); err != nil {
 		return err
 	}
 	fmt.Printf("已添加订阅源：%s\n", fs.Arg(0))
@@ -164,10 +204,11 @@ func addFeed(args []string) error {
 func listFeeds(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load(*configPath)
+	_, cfg, _, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -186,14 +227,14 @@ func listFeeds(args []string) error {
 }
 
 func feedback(args []string) error {
-	configPath, positional, err := feedbackArgs(args)
+	configPath, profileName, positional, err := feedbackArgs(args)
 	if err != nil {
 		return err
 	}
 	if len(positional) == 0 {
 		return fmt.Errorf("用法：rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]")
 	}
-	cfg, err := config.Load(configPath)
+	_, cfg, profileID, err := loadConfigProfile(configPath, profileName)
 	if err != nil {
 		return err
 	}
@@ -217,7 +258,7 @@ func feedback(args []string) error {
 				return err
 			}
 		}
-		entries, err := db.ListFeedback(ctx, action)
+		entries, err := db.ListFeedbackForProfile(ctx, profileID, action)
 		if err != nil {
 			return err
 		}
@@ -246,7 +287,7 @@ func feedback(args []string) error {
 		if err != nil {
 			return err
 		}
-		removed, err := db.RemoveFeedback(ctx, positional[2], action)
+		removed, err := db.RemoveFeedbackForProfile(ctx, profileID, positional[2], action)
 		if err != nil {
 			return err
 		}
@@ -263,7 +304,7 @@ func feedback(args []string) error {
 		if err != nil {
 			return err
 		}
-		entry, err := db.RecordFeedback(ctx, positional[1], action)
+		entry, err := db.RecordFeedbackForProfile(ctx, profileID, positional[1], action)
 		if err != nil {
 			return err
 		}
@@ -272,29 +313,39 @@ func feedback(args []string) error {
 	}
 }
 
-func feedbackArgs(args []string) (string, []string, error) {
+func feedbackArgs(args []string) (string, string, []string, error) {
 	configPath := defaultConfigPath
+	profileName := config.DefaultProfileName
 	positional := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "-config":
 			if i+1 >= len(args) {
-				return "", nil, errors.New("-config 需要配置文件路径")
+				return "", "", nil, errors.New("-config 需要配置文件路径")
 			}
 			configPath = args[i+1]
 			i++
 		case strings.HasPrefix(args[i], "-config="):
 			configPath = strings.TrimPrefix(args[i], "-config=")
+		case args[i] == "-profile":
+			if i+1 >= len(args) {
+				return "", "", nil, errors.New("-profile 需要 profile 名称")
+			}
+			profileName = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "-profile="):
+			profileName = strings.TrimPrefix(args[i], "-profile=")
 		default:
 			positional = append(positional, args[i])
 		}
 	}
-	return configPath, positional, nil
+	return configPath, profileName, positional, nil
 }
 
 func review(args []string) error {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	limit := fs.Int("limit", 20, "显示最近条目数")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -302,7 +353,7 @@ func review(args []string) error {
 	if *limit <= 0 {
 		return errors.New("-limit 必须大于 0")
 	}
-	cfg, err := config.Load(*configPath)
+	_, cfg, profileID, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -311,7 +362,7 @@ func review(args []string) error {
 		return err
 	}
 	defer db.Close()
-	items, err := db.RecentItems(context.Background(), *limit)
+	items, err := db.RecentItemsForProfile(context.Background(), profileID, *limit)
 	if err != nil {
 		return err
 	}
@@ -332,12 +383,13 @@ func review(args []string) error {
 func runOnce(args []string) error {
 	fs := flag.NewFlagSet("once", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	dryRun := fs.Bool("dry-run", false, "只输出结果，不写入状态，不发 webhook")
 	includeSeen := fs.Bool("include-seen", false, "包含已处理过的条目")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load(*configPath)
+	_, cfg, profileID, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
@@ -346,6 +398,7 @@ func runOnce(args []string) error {
 	summary, err := app.RunOnce(ctx, cfg, app.RunOptions{
 		DryRun:      *dryRun,
 		IncludeSeen: *includeSeen,
+		ProfileID:   profileID,
 	})
 	for _, fetchErr := range summary.Errors {
 		fmt.Fprintf(os.Stderr, "抓取警告：%v\n", fetchErr)
@@ -368,17 +421,18 @@ func runOnce(args []string) error {
 func watch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	profileName := fs.String("profile", config.DefaultProfileName, "profile 名称")
 	includeSeen := fs.Bool("include-seen", false, "包含已处理过的条目")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load(*configPath)
+	_, cfg, profileID, err := loadConfigProfile(*configPath, *profileName)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signalContext()
 	defer stop()
-	return app.Watch(ctx, cfg, app.RunOptions{IncludeSeen: *includeSeen})
+	return app.Watch(ctx, cfg, app.RunOptions{IncludeSeen: *includeSeen, ProfileID: profileID})
 }
 
 func signalContext() (context.Context, context.CancelFunc) {
@@ -401,16 +455,16 @@ func usage() {
 
 用法：
   rss-agent init [-config config.yaml]
-  rss-agent add <name> <url> [-tag ai] [-tag go]
-  rss-agent list [-config config.yaml]
-  rss-agent import-opml <subscriptions.opml> [-config config.yaml]
-  rss-agent export-opml <subscriptions.opml> [-config config.yaml]
-  rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]
-  rss-agent feedback list [action] [-config config.yaml]
-  rss-agent feedback remove <action> <item-id> [-config config.yaml]
-  rss-agent review [-limit 20] [-config config.yaml]
-  rss-agent once [-config config.yaml] [-dry-run] [-include-seen]
-  rss-agent watch [-config config.yaml]
+  rss-agent add [-config config.yaml] [-profile default] [-tag ai] [-tag go] <name> <url>
+  rss-agent list [-config config.yaml] [-profile default]
+  rss-agent import-opml [-config config.yaml] [-profile default] <subscriptions.opml>
+  rss-agent export-opml [-config config.yaml] [-profile default] <subscriptions.opml>
+  rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml] [-profile default]
+  rss-agent feedback list [action] [-config config.yaml] [-profile default]
+  rss-agent feedback remove <action> <item-id> [-config config.yaml] [-profile default]
+  rss-agent review [-limit 20] [-config config.yaml] [-profile default]
+  rss-agent once [-config config.yaml] [-profile default] [-dry-run] [-include-seen]
+  rss-agent watch [-config config.yaml] [-profile default]
 
 环境变量：
   ARK_API_KEY        火山方舟 API Key
