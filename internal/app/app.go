@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/cloudwego/eino/compose"
 	"github.com/jeffery/rss-agent/internal/agent"
 	"github.com/jeffery/rss-agent/internal/config"
 	"github.com/jeffery/rss-agent/internal/push"
@@ -31,6 +32,17 @@ type RunSummary struct {
 	Errors      []error
 }
 
+type runState struct {
+	cfg        *config.Config
+	options    RunOptions
+	db         *store.DB
+	fetcher    *rss.Fetcher
+	summary    RunSummary
+	fetched    []rss.Item
+	candidates []rss.Item
+	decisions  []agent.Result
+}
+
 func RunOnce(ctx context.Context, cfg *config.Config, options RunOptions) (RunSummary, error) {
 	db, err := store.Open(cfg.DatabasePath())
 	if err != nil {
@@ -38,112 +50,197 @@ func RunOnce(ctx context.Context, cfg *config.Config, options RunOptions) (RunSu
 	}
 	defer db.Close()
 
-	fetcher := rss.NewFetcher(cfg.HTTPTimeout())
-	var feedStore rss.FeedStateStore
-	if !options.DryRun {
-		feedStore = db
+	state := &runState{
+		cfg:     cfg,
+		options: options,
+		db:      db,
+		fetcher: rss.NewFetcher(cfg.HTTPTimeout()),
 	}
-	fetched := fetcher.Fetch(ctx, cfg.EnabledFeeds(), cfg.Settings.MaxItemsPerFeed, feedStore)
-	summary := RunSummary{
+	flow, err := newRunGraph(ctx)
+	if err != nil {
+		return state.summary, err
+	}
+	output, err := flow.Invoke(ctx, state)
+	if output == nil {
+		output = state
+	}
+	return output.summary, err
+}
+
+func newRunGraph(ctx context.Context) (compose.Runnable[*runState, *runState], error) {
+	graph := compose.NewGraph[*runState, *runState]()
+	nodes := []struct {
+		key string
+		run func(context.Context, *runState) (*runState, error)
+	}{
+		{key: "fetch", run: fetchRunNode},
+		{key: "filter", run: filterRunNode},
+		{key: "enrich", run: enrichRunNode},
+		{key: "analyze", run: analyzeRunNode},
+		{key: "push", run: pushRunNode},
+	}
+	for _, node := range nodes {
+		if err := graph.AddLambdaNode(node.key, compose.InvokableLambda[*runState, *runState](node.run)); err != nil {
+			return nil, fmt.Errorf("添加 %s 节点失败：%w", node.key, err)
+		}
+	}
+	edges := [][2]string{
+		{compose.START, "fetch"},
+		{"fetch", "filter"},
+		{"filter", "enrich"},
+		{"enrich", "analyze"},
+		{"analyze", "push"},
+		{"push", compose.END},
+	}
+	for _, edge := range edges {
+		if err := graph.AddEdge(edge[0], edge[1]); err != nil {
+			return nil, fmt.Errorf("添加 %s -> %s 边失败：%w", edge[0], edge[1], err)
+		}
+	}
+	return graph.Compile(ctx, compose.WithGraphName("rss-agent"))
+}
+
+func fetchRunNode(ctx context.Context, state *runState) (*runState, error) {
+	var feedStore rss.FeedStateStore
+	if !state.options.DryRun {
+		feedStore = state.db
+	}
+	fetched := state.fetcher.Fetch(ctx, state.cfg.EnabledFeeds(), state.cfg.Settings.MaxItemsPerFeed, feedStore)
+	state.fetched = fetched.Items
+	state.summary = RunSummary{
 		Fetched:     len(fetched.Items),
 		NotModified: fetched.NotModified,
 		Errors:      fetched.Errs,
 	}
-	if !options.DryRun {
-		for _, item := range fetched.Items {
-			if err := db.UpsertItem(ctx, item); err != nil {
-				return summary, err
+	if !state.options.DryRun {
+		for _, item := range state.fetched {
+			if err := state.db.UpsertItem(ctx, item); err != nil {
+				return state, err
 			}
 		}
 	}
+	return state, nil
+}
 
+func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
 	seenIDs := map[string]bool{}
-	if !options.IncludeSeen {
-		seenIDs, err = db.SeenIDs(ctx)
+	if !state.options.IncludeSeen {
+		var err error
+		seenIDs, err = state.db.SeenIDs(ctx)
 		if err != nil {
-			return summary, err
+			return state, err
 		}
 	}
-
-	filtered := triage.Filter(fetched.Items, seenIDs, cfg.Profile, cfg.Settings, options.IncludeSeen, time.Now())
-	candidates := filtered.Items
-	summary.Triage = filtered.Stats
-	summary.Candidate = len(candidates)
-	if len(candidates) == 0 {
-		return summary, nil
-	}
-
-	profileHash := cfg.ProfileHash()
-	cached, uncached, err := splitCached(ctx, db, candidates, profileHash, cfg.AnalysisCacheTTL())
+	feedback, err := state.db.FeedbackFilters(ctx)
 	if err != nil {
-		return summary, err
+		return state, err
 	}
-	summary.Cached = len(cached)
-	decisions := cached
-	if len(uncached) > 0 {
-		if err := checkBudget(ctx, db, cfg); err != nil {
-			return summary, err
-		}
-		modelCfgs, err := cfg.ResolvedModels()
-		if err != nil {
-			return summary, err
-		}
-		rssAgent, err := agent.NewPool(ctx, modelCfgs)
-		if err != nil {
-			return summary, err
-		}
-		fresh, usages, err := rssAgent.AnalyzeWithUsage(ctx, cfg.Profile, uncached, cfg.Settings.BatchSize)
-		if err != nil {
-			return summary, err
-		}
-		summary.Analyzed = len(fresh)
-		if !options.DryRun {
-			for _, result := range fresh {
-				if err := db.SaveAnalysis(ctx, result.Item, profileHash, result.ModelLabel, result.ModelName, result.Decision); err != nil {
-					return summary, err
-				}
-			}
-			cost, err := recordUsageCosts(ctx, db, modelCfgs, usages)
-			if err != nil {
-				return summary, err
-			}
-			summary.LLMCostCNY = cost
-		}
-		decisions = append(decisions, fresh...)
-	}
-	sortResults(decisions)
+	filtered := triage.FilterWithFeedback(state.fetched, seenIDs, triage.FeedbackRules{
+		BlockedItemIDs:  feedback.BlockedItemIDs,
+		BlockedFeedURLs: feedback.BlockedFeedURLs,
+	}, state.cfg.Profile, state.cfg.Settings, state.options.IncludeSeen, time.Now())
+	state.candidates = filtered.Items
+	state.summary.Triage = filtered.Stats
+	state.summary.Candidate = len(state.candidates)
+	return state, nil
+}
 
-	selected := selectPushes(decisions, cfg.Settings.MinScore, cfg.Settings.MaxPushes)
-	summary.Pushed = len(selected)
-	if options.DryRun {
+func enrichRunNode(ctx context.Context, state *runState) (*runState, error) {
+	if len(state.candidates) == 0 {
+		return state, nil
+	}
+	fullText := state.fetcher.EnrichFullText(ctx, state.candidates, state.cfg.Settings.FullTextMinChars, state.cfg.Settings.FullTextMaxChars)
+	state.candidates = fullText.Items
+	state.summary.Errors = append(state.summary.Errors, fullText.Errs...)
+	if !state.options.DryRun {
+		for _, item := range state.candidates {
+			if err := state.db.UpsertItem(ctx, item); err != nil {
+				return state, err
+			}
+		}
+	}
+	return state, nil
+}
+
+func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
+	if len(state.candidates) == 0 {
+		return state, nil
+	}
+	profileHash := state.cfg.ProfileHash()
+	cached, uncached, err := splitCached(ctx, state.db, state.candidates, profileHash, state.cfg.AnalysisCacheTTL())
+	if err != nil {
+		return state, err
+	}
+	state.summary.Cached = len(cached)
+	state.decisions = cached
+	if len(uncached) == 0 {
+		return state, nil
+	}
+	if err := checkBudget(ctx, state.db, state.cfg); err != nil {
+		return state, err
+	}
+	modelCfgs, err := state.cfg.ResolvedModels()
+	if err != nil {
+		return state, err
+	}
+	rssAgent, err := agent.NewPool(ctx, modelCfgs)
+	if err != nil {
+		return state, err
+	}
+	fresh, usages, err := rssAgent.AnalyzeWithUsage(ctx, state.cfg.Profile, uncached, state.cfg.Settings.BatchSize)
+	if err != nil {
+		return state, err
+	}
+	state.summary.Analyzed = len(fresh)
+	if !state.options.DryRun {
+		for _, result := range fresh {
+			if err := state.db.SaveAnalysis(ctx, result.Item, profileHash, result.ModelLabel, result.ModelName, result.Decision); err != nil {
+				return state, err
+			}
+		}
+		cost, err := recordUsageCosts(ctx, state.db, modelCfgs, usages)
+		if err != nil {
+			return state, err
+		}
+		state.summary.LLMCostCNY = cost
+	}
+	state.decisions = append(state.decisions, fresh...)
+	return state, nil
+}
+
+func pushRunNode(ctx context.Context, state *runState) (*runState, error) {
+	sortResults(state.decisions)
+	selected := selectPushes(state.decisions, state.cfg.Settings.MinScore, state.cfg.Settings.MaxPushes)
+	state.summary.Pushed = len(selected)
+	if state.options.DryRun {
 		fmt.Print(push.FormatMarkdown(selected))
-		return summary, nil
+		return state, nil
 	}
 
 	pusher := &push.Pusher{
-		Console:    cfg.Push.Console,
-		WebhookURL: cfg.WebhookURL(),
+		Console:    state.cfg.Push.Console,
+		WebhookURL: state.cfg.WebhookURL(),
 	}
 	if err := pusher.Push(ctx, selected); err != nil {
 		for _, result := range selected {
-			_ = db.RecordPush(ctx, result.Item.StableID(), "push", false, err.Error())
+			_ = state.db.RecordPush(ctx, result.Item.StableID(), "push", false, err.Error())
 		}
-		return summary, err
+		return state, err
 	}
 
 	pushed := make(map[string]bool, len(selected))
 	for _, result := range selected {
 		pushed[result.Item.StableID()] = true
-		if err := db.RecordPush(ctx, result.Item.StableID(), "push", true, ""); err != nil {
-			return summary, err
+		if err := state.db.RecordPush(ctx, result.Item.StableID(), "push", true, ""); err != nil {
+			return state, err
 		}
 	}
-	for _, item := range candidates {
-		if err := db.MarkSeen(ctx, item, pushed[item.StableID()]); err != nil {
-			return summary, err
+	for _, item := range state.candidates {
+		if err := state.db.MarkSeen(ctx, item, pushed[item.StableID()]); err != nil {
+			return state, err
 		}
 	}
-	return summary, nil
+	return state, nil
 }
 
 func Watch(ctx context.Context, cfg *config.Config, options RunOptions) error {
@@ -295,12 +392,13 @@ func printSummary(summary RunSummary, runErr error) {
 	}
 	fmt.Printf("RSS Agent：抓取 %d 条，候选 %d 条，分析 %d 条，推送 %d 条。\n",
 		summary.Fetched, summary.Candidate, summary.Analyzed, summary.Pushed)
-	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
+	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、反馈屏蔽 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
 		summary.Triage.Skipped(),
 		summary.Triage.Duplicate,
 		summary.Triage.Seen,
 		summary.Triage.Stale,
 		summary.Triage.Muted,
+		summary.Triage.FeedbackBlocked,
 		summary.Triage.Excluded,
 		summary.Triage.MissingRequired,
 		summary.Triage.Capped)

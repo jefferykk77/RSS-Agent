@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/jeffery/rss-agent/internal/app"
 	"github.com/jeffery/rss-agent/internal/config"
 	"github.com/jeffery/rss-agent/internal/opml"
+	"github.com/jeffery/rss-agent/internal/store"
 )
 
 const defaultConfigPath = "config.yaml"
@@ -40,6 +42,10 @@ func run() error {
 		return importOPML(os.Args[2:])
 	case "export-opml":
 		return exportOPML(os.Args[2:])
+	case "feedback":
+		return feedback(os.Args[2:])
+	case "review":
+		return review(os.Args[2:])
 	case "once":
 		return runOnce(os.Args[2:])
 	case "watch":
@@ -179,6 +185,150 @@ func listFeeds(args []string) error {
 	return nil
 }
 
+func feedback(args []string) error {
+	configPath, positional, err := feedbackArgs(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) == 0 {
+		return fmt.Errorf("用法：rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]")
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(cfg.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ctx, stop := signalContext()
+	defer stop()
+
+	switch positional[0] {
+	case "list":
+		var action store.FeedbackAction
+		if len(positional) > 2 {
+			return fmt.Errorf("用法：rss-agent feedback list [action] [-config config.yaml]")
+		}
+		if len(positional) == 2 {
+			action, err = store.ParseFeedbackAction(positional[1])
+			if err != nil {
+				return err
+			}
+		}
+		entries, err := db.ListFeedback(ctx, action)
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			fmt.Println("暂无反馈记录。")
+			return nil
+		}
+		for _, entry := range entries {
+			title := entry.Title
+			if title == "" {
+				title = entry.ItemID
+			}
+			fmt.Printf("%s  %-10s  %s — %s\n",
+				entry.CreatedAt.Local().Format("2006-01-02 15:04"),
+				entry.Action,
+				title,
+				entry.FeedName,
+			)
+		}
+		return nil
+	case "remove":
+		if len(positional) != 3 {
+			return fmt.Errorf("用法：rss-agent feedback remove <action> <item-id> [-config config.yaml]")
+		}
+		action, err := store.ParseFeedbackAction(positional[1])
+		if err != nil {
+			return err
+		}
+		removed, err := db.RemoveFeedback(ctx, positional[2], action)
+		if err != nil {
+			return err
+		}
+		if !removed {
+			return fmt.Errorf("条目 %q 没有 %s 反馈", positional[2], action)
+		}
+		fmt.Printf("已移除 %s：%s\n", action, positional[2])
+		return nil
+	default:
+		if len(positional) != 2 {
+			return fmt.Errorf("用法：rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]")
+		}
+		action, err := store.ParseFeedbackAction(positional[0])
+		if err != nil {
+			return err
+		}
+		entry, err := db.RecordFeedback(ctx, positional[1], action)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已记录 %s：%s\n", entry.Action, entry.Title)
+		return nil
+	}
+}
+
+func feedbackArgs(args []string) (string, []string, error) {
+	configPath := defaultConfigPath
+	positional := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "-config":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("-config 需要配置文件路径")
+			}
+			configPath = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "-config="):
+			configPath = strings.TrimPrefix(args[i], "-config=")
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	return configPath, positional, nil
+}
+
+func review(args []string) error {
+	fs := flag.NewFlagSet("review", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
+	limit := fs.Int("limit", 20, "显示最近条目数")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *limit <= 0 {
+		return errors.New("-limit 必须大于 0")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(cfg.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	items, err := db.RecentItems(context.Background(), *limit)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Println("暂无已保存条目。先运行一次不带 -dry-run 的 once。")
+		return nil
+	}
+	for _, item := range items {
+		published := "未知时间"
+		if !item.PublishedAt.IsZero() {
+			published = item.PublishedAt.Local().Format("2006-01-02 15:04")
+		}
+		fmt.Printf("%s  %s\n  %s · %s\n  %s\n", item.ID, item.Title, item.FeedName, published, item.Link)
+	}
+	return nil
+}
+
 func runOnce(args []string) error {
 	fs := flag.NewFlagSet("once", flag.ExitOnError)
 	configPath := fs.String("config", defaultConfigPath, "配置文件路径")
@@ -202,12 +352,13 @@ func runOnce(args []string) error {
 	}
 	fmt.Printf("完成：抓取 %d 条，候选 %d 条，分析 %d 条，推送 %d 条。\n",
 		summary.Fetched, summary.Candidate, summary.Analyzed, summary.Pushed)
-	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
+	fmt.Printf("本地筛选：跳过 %d 条（重复 %d、已读 %d、过期 %d、静默 %d、反馈屏蔽 %d、排除 %d、未命中必须项 %d、候选限额 %d）。\n",
 		summary.Triage.Skipped(),
 		summary.Triage.Duplicate,
 		summary.Triage.Seen,
 		summary.Triage.Stale,
 		summary.Triage.Muted,
+		summary.Triage.FeedbackBlocked,
 		summary.Triage.Excluded,
 		summary.Triage.MissingRequired,
 		summary.Triage.Capped)
@@ -254,6 +405,10 @@ func usage() {
   rss-agent list [-config config.yaml]
   rss-agent import-opml <subscriptions.opml> [-config config.yaml]
   rss-agent export-opml <subscriptions.opml> [-config config.yaml]
+  rss-agent feedback <like|dislike|block|save|later|block-feed> <item-id> [-config config.yaml]
+  rss-agent feedback list [action] [-config config.yaml]
+  rss-agent feedback remove <action> <item-id> [-config config.yaml]
+  rss-agent review [-limit 20] [-config config.yaml]
   rss-agent once [-config config.yaml] [-dry-run] [-include-seen]
   rss-agent watch [-config config.yaml]
 

@@ -1,4 +1,5 @@
 .rss-agent/
+config.yaml
 /rss-agent.exe
 /rss-agent
 dist/

@@ -59,13 +59,21 @@ func (i Item) Time() time.Time {
 }
 
 func (i Item) Snippet(limit int) string {
-	text := firstNonEmpty(i.Summary, i.Content)
-	text = cleanText(text)
+	text := i.Text()
 	if limit <= 0 || len([]rune(text)) <= limit {
 		return text
 	}
 	runes := []rune(text)
 	return strings.TrimSpace(string(runes[:limit])) + "..."
+}
+
+func (i Item) Text() string {
+	summary := cleanText(i.Summary)
+	content := cleanText(i.Content)
+	if len([]rune(content)) > len([]rune(summary)) {
+		return content
+	}
+	return summary
 }
 
 func cleanText(s string) string {
