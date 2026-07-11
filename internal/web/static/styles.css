@@ -1050,6 +1050,109 @@ kbd {
   background: var(--danger);
 }
 
+.detail-empty[hidden],
+.detail-content[hidden] {
+  display: none !important;
+}
+
+.topic-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.digest-history {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.digest-history select {
+  height: 32px;
+  max-width: 210px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.topic-filter select {
+  min-width: 112px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.preference-feedback {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.signal-button {
+  min-height: 30px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-muted);
+  cursor: pointer;
+}
+
+.signal-button:hover,
+.signal-button.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ingest-dialog {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.ingest-form {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.ingest-form header,
+.ingest-form footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ingest-form h2 {
+  margin: 2px 0 0;
+  font-size: 20px;
+}
+
+.ingest-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+
+.ingest-form input,
+.ingest-form textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
 .mobile-only {
   display: none;
 }

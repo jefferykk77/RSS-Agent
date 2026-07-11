@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,12 +38,17 @@ type CostEvent struct {
 type FeedbackAction string
 
 const (
-	FeedbackLike      FeedbackAction = "like"
-	FeedbackDislike   FeedbackAction = "dislike"
-	FeedbackBlock     FeedbackAction = "block"
-	FeedbackSave      FeedbackAction = "save"
-	FeedbackLater     FeedbackAction = "later"
-	FeedbackBlockFeed FeedbackAction = "block-feed"
+	FeedbackLike           FeedbackAction = "like"
+	FeedbackDislike        FeedbackAction = "dislike"
+	FeedbackBlock          FeedbackAction = "block"
+	FeedbackSave           FeedbackAction = "save"
+	FeedbackLater          FeedbackAction = "later"
+	FeedbackBlockFeed      FeedbackAction = "block-feed"
+	FeedbackTooShallow     FeedbackAction = "too-shallow"
+	FeedbackTooTheoretical FeedbackAction = "too-theoretical"
+	FeedbackTooMarketing   FeedbackAction = "too-marketing"
+	FeedbackUnusable       FeedbackAction = "unusable"
+	FeedbackMoreLikeThis   FeedbackAction = "more-like-this"
 )
 
 type Feedback struct {
@@ -93,6 +99,125 @@ type DigestItem struct {
 	Feedback      []FeedbackAction
 }
 
+type SourceHealth struct {
+	URL           string
+	Status        int
+	LastError     string
+	FailCount     int
+	LastFetchedAt time.Time
+}
+
+type DigestEdition struct {
+	ID        int64
+	ProfileID string
+	Slot      string
+	ItemIDs   []string
+	Success   bool
+	CreatedAt time.Time
+}
+
+type AnalysisTask struct {
+	ID          int64
+	RunID       int64
+	ProfileID   string
+	ProfileHash string
+	ItemID      string
+	ContentHash string
+	Priority    int
+	Status      string
+	Attempts    int
+	NextRetryAt time.Time
+	LastError   string
+}
+
+type AnalysisQueueStats struct {
+	Completed   int `json:"completed"`
+	Pending     int `json:"pending"`
+	Running     int `json:"running"`
+	Retrying    int `json:"retrying"`
+	RateLimited int `json:"rate_limited"`
+	Failed      int `json:"failed"`
+}
+
+type AnalysisRun struct {
+	ID          int64     `json:"run_id"`
+	ProfileID   string    `json:"profile"`
+	Status      string    `json:"status"`
+	Total       int       `json:"total"`
+	Cached      int       `json:"cached"`
+	Analyzed    int       `json:"analyzed"`
+	Pending     int       `json:"pending"`
+	Running     int       `json:"running"`
+	Retrying    int       `json:"retrying"`
+	RateLimited int       `json:"rate_limited"`
+	Failed      int       `json:"failed"`
+	CreatedAt   time.Time `json:"created_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+
+type DigestPage struct {
+	Items      []DigestItem
+	NextCursor string
+}
+
+func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, order string, limit int, cursor string) (DigestPage, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	all, err := db.DigestItemsForProfile(ctx, profileID, profileHash, 5000)
+	if err != nil {
+		return DigestPage{}, err
+	}
+	if order == "newest" {
+		sort.SliceStable(all, func(i, j int) bool { return all[i].PublishedAt.After(all[j].PublishedAt) })
+		counts := map[string]int{}
+		first := make([]DigestItem, 0, len(all))
+		overflow := make([]DigestItem, 0, len(all))
+		for _, item := range all {
+			if counts[item.FeedURL] < 10 {
+				counts[item.FeedURL]++
+				first = append(first, item)
+			} else {
+				overflow = append(overflow, item)
+			}
+		}
+		all = append(first, overflow...)
+	} else {
+		filtered := all[:0]
+		for _, item := range all {
+			if !item.AnalyzedAt.IsZero() {
+				filtered = append(filtered, item)
+			}
+		}
+		all = filtered
+		sort.SliceStable(all, func(i, j int) bool {
+			if all[i].Score == all[j].Score {
+				return all[i].PublishedAt.After(all[j].PublishedAt)
+			}
+			return all[i].Score > all[j].Score
+		})
+	}
+	offset := 0
+	if cursor != "" {
+		_, _ = fmt.Sscanf(cursor, "%d", &offset)
+	}
+	if offset < 0 || offset > len(all) {
+		offset = 0
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	page := DigestPage{Items: append([]DigestItem(nil), all[offset:end]...)}
+	if end < len(all) {
+		page.NextCursor = fmt.Sprintf("%d", end)
+	}
+	return page, nil
+}
+
 func ParseFeedbackAction(raw string) (FeedbackAction, error) {
 	action := FeedbackAction(strings.ToLower(strings.TrimSpace(raw)))
 	if !action.Valid() {
@@ -103,7 +228,8 @@ func ParseFeedbackAction(raw string) (FeedbackAction, error) {
 
 func (a FeedbackAction) Valid() bool {
 	switch a {
-	case FeedbackLike, FeedbackDislike, FeedbackBlock, FeedbackSave, FeedbackLater, FeedbackBlockFeed:
+	case FeedbackLike, FeedbackDislike, FeedbackBlock, FeedbackSave, FeedbackLater, FeedbackBlockFeed,
+		FeedbackTooShallow, FeedbackTooTheoretical, FeedbackTooMarketing, FeedbackUnusable, FeedbackMoreLikeThis:
 		return true
 	default:
 		return false
@@ -252,6 +378,13 @@ func (db *DB) migrate() error {
 			PRIMARY KEY (profile_id, item_id, action)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profile_feedback_action_created ON profile_feedback(profile_id, action, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS profile_feedback_signals (
+			profile_id TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (profile_id, item_id, action)
+		)`,
 		`CREATE TABLE IF NOT EXISTS cost_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			scope TEXT NOT NULL,
@@ -266,11 +399,51 @@ func (db *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_cost_events_scope_created ON cost_events(scope, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_cost_events_model_created ON cost_events(provider, model, created_at)`,
+		`CREATE TABLE IF NOT EXISTS digest_editions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			profile_id TEXT NOT NULL,
+			slot TEXT NOT NULL,
+			item_ids_json TEXT NOT NULL,
+			success INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_digest_editions_profile_created ON digest_editions(profile_id, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS analysis_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			profile_id TEXT NOT NULL,
+			profile_hash TEXT NOT NULL,
+			item_id TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			prompt_version TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_retry_at TEXT,
+			last_error TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(item_id, profile_hash, content_hash, prompt_version)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_analysis_tasks_ready ON analysis_tasks(profile_id, status, priority DESC, created_at)`,
+		`CREATE TABLE IF NOT EXISTS analysis_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			profile_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			total INTEGER NOT NULL DEFAULT 0,
+			cached INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			completed_at TEXT,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_profile_created ON analysis_runs(profile_id, created_at DESC)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.sql.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	if err := db.ensureColumn("analysis_tasks", "run_id", "INTEGER"); err != nil {
+		return err
 	}
 	legacyMigrations := []string{
 		`INSERT OR IGNORE INTO profile_items (profile_id, item_id, added_at)
@@ -286,6 +459,28 @@ func (db *DB) migrate() error {
 		}
 	}
 	return nil
+}
+
+func (db *DB) ensureColumn(table, column, definition string) error {
+	rows, err := db.sql.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	_, err = db.sql.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func (db *DB) GetFeedState(ctx context.Context, feedURL string) (rss.FeedFetchState, bool, error) {
@@ -326,6 +521,81 @@ func (db *DB) SaveFeedState(ctx context.Context, state rss.FeedFetchState) error
 		now,
 	)
 	return err
+}
+
+func (db *DB) ListSourceHealth(ctx context.Context) ([]SourceHealth, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT feed_url, last_status, COALESCE(last_error, ''), fail_count, COALESCE(last_fetched_at, '')
+		FROM feed_fetch_states ORDER BY last_fetched_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []SourceHealth
+	for rows.Next() {
+		var item SourceHealth
+		var fetched string
+		if err := rows.Scan(&item.URL, &item.Status, &item.LastError, &item.FailCount, &fetched); err != nil {
+			return nil, err
+		}
+		item.LastFetchedAt = parseTime(fetched)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (db *DB) RecordDigestEdition(ctx context.Context, profileID string, slot string, itemIDs []string, success bool) error {
+	encoded, err := json.Marshal(itemIDs)
+	if err != nil {
+		return err
+	}
+	_, err = db.sql.ExecContext(ctx, `INSERT INTO digest_editions (profile_id, slot, item_ids_json, success, created_at)
+		VALUES (?, ?, ?, ?, ?)`, normalizeProfileID(profileID), slot, string(encoded), boolInt(success), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (db *DB) DigestEditions(ctx context.Context, profileID string, limit int) ([]DigestEdition, error) {
+	if limit <= 0 || limit > 60 {
+		limit = 30
+	}
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, profile_id, slot, item_ids_json, success, created_at
+		FROM digest_editions WHERE profile_id = ? ORDER BY created_at DESC LIMIT ?`, normalizeProfileID(profileID), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var editions []DigestEdition
+	for rows.Next() {
+		var edition DigestEdition
+		var encoded, created string
+		var success int
+		if err := rows.Scan(&edition.ID, &edition.ProfileID, &edition.Slot, &encoded, &success, &created); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(encoded), &edition.ItemIDs); err != nil {
+			return nil, err
+		}
+		edition.Success = success != 0
+		edition.CreatedAt = parseTime(created)
+		editions = append(editions, edition)
+	}
+	return editions, rows.Err()
+}
+
+func (db *DB) DigestItemCountSince(ctx context.Context, profileID string, since time.Time) (int, error) {
+	editions, err := db.DigestEditions(ctx, profileID, 60)
+	if err != nil {
+		return 0, err
+	}
+	seen := map[string]bool{}
+	for _, edition := range editions {
+		if !edition.Success || edition.CreatedAt.Before(since) {
+			continue
+		}
+		for _, id := range edition.ItemIDs {
+			seen[id] = true
+		}
+	}
+	return len(seen), nil
 }
 
 func (db *DB) UpsertItem(ctx context.Context, item rss.Item) error {
@@ -386,6 +656,51 @@ func (db *DB) UpsertProfileItem(ctx context.Context, profileID string, item rss.
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (db *DB) ItemForProfile(ctx context.Context, profileID string, itemID string) (rss.Item, error) {
+	profileID = normalizeProfileID(profileID)
+	row := db.sql.QueryRowContext(ctx, `SELECT
+		i.id, i.feed_name, i.feed_url, COALESCE(i.feed_tags_json, '[]'),
+		COALESCE(i.title, ''), COALESCE(i.link, ''), COALESCE(i.guid, ''), COALESCE(i.author, ''),
+		COALESCE(i.categories_json, '[]'), COALESCE(i.published_at, ''), COALESCE(i.updated_at, ''),
+		COALESCE(i.summary, ''), COALESCE(i.content, '')
+		FROM profile_items p
+		JOIN items i ON i.id = p.item_id
+		WHERE p.profile_id = ? AND p.item_id = ?`, profileID, itemID)
+	var (
+		item           rss.Item
+		feedTagsJSON   string
+		categoriesJSON string
+		publishedRaw   string
+		updatedRaw     string
+	)
+	if err := row.Scan(
+		&item.ID,
+		&item.FeedName,
+		&item.FeedURL,
+		&feedTagsJSON,
+		&item.Title,
+		&item.Link,
+		&item.GUID,
+		&item.Author,
+		&categoriesJSON,
+		&publishedRaw,
+		&updatedRaw,
+		&item.Summary,
+		&item.Content,
+	); err != nil {
+		return rss.Item{}, err
+	}
+	if err := json.Unmarshal([]byte(feedTagsJSON), &item.FeedTags); err != nil {
+		return rss.Item{}, fmt.Errorf("decode feed tags: %w", err)
+	}
+	if err := json.Unmarshal([]byte(categoriesJSON), &item.Categories); err != nil {
+		return rss.Item{}, fmt.Errorf("decode categories: %w", err)
+	}
+	item.PublishedAt = parseTime(publishedRaw)
+	item.UpdatedAt = parseTime(updatedRaw)
+	return item, nil
 }
 
 func (db *DB) SeenIDs(ctx context.Context) (map[string]bool, error) {
@@ -467,18 +782,19 @@ func (db *DB) MarkSeenForProfile(ctx context.Context, profileID string, item rss
 }
 
 func (db *DB) CachedAnalysis(ctx context.Context, item rss.Item, profileHash string, ttl time.Duration) (agent.Result, bool, error) {
-	row := db.sql.QueryRowContext(ctx, `SELECT model_label, score, should_push, title, summary, why, key_points_json, tags_json, created_at
+	row := db.sql.QueryRowContext(ctx, `SELECT model_label, model_name, score, should_push, title, summary, why, key_points_json, tags_json, created_at
 		FROM item_analyses WHERE item_id = ? AND profile_hash = ? AND content_hash = ?`,
 		item.StableID(), profileHash, item.ContentHash())
 	var (
 		modelLabel    string
+		modelName     string
 		decision      agent.Decision
 		shouldPush    int
 		keyPointsJSON string
 		tagsJSON      string
 		createdAtRaw  string
 	)
-	if err := row.Scan(&modelLabel, &decision.Score, &shouldPush, &decision.Title, &decision.Summary, &decision.Why, &keyPointsJSON, &tagsJSON, &createdAtRaw); err != nil {
+	if err := row.Scan(&modelLabel, &modelName, &decision.Score, &shouldPush, &decision.Title, &decision.Summary, &decision.Why, &keyPointsJSON, &tagsJSON, &createdAtRaw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return agent.Result{}, false, nil
 		}
@@ -496,7 +812,7 @@ func (db *DB) CachedAnalysis(ctx context.Context, item rss.Item, profileHash str
 	if err := json.Unmarshal([]byte(tagsJSON), &decision.Tags); err != nil {
 		return agent.Result{}, false, err
 	}
-	return agent.Result{Item: item, Decision: decision, ModelLabel: modelLabel, Cached: true}, true, nil
+	return agent.Result{Item: item, Decision: decision, ModelLabel: modelLabel, ModelName: modelName, Cached: true}, true, nil
 }
 
 func (db *DB) SaveAnalysis(ctx context.Context, item rss.Item, profileHash string, modelLabel string, modelName string, decision agent.Decision) error {
@@ -634,6 +950,12 @@ func (db *DB) RecordFeedbackForProfile(ctx context.Context, profileID string, it
 	}
 
 	feedback.CreatedAt = time.Now().UTC()
+	if isPreferenceSignal(action) {
+		_, err = db.sql.ExecContext(ctx, `INSERT INTO profile_feedback_signals (profile_id, item_id, action, created_at)
+			VALUES (?, ?, ?, ?) ON CONFLICT(profile_id, item_id, action) DO UPDATE SET created_at = excluded.created_at`,
+			profileID, itemID, action, feedback.CreatedAt.Format(time.RFC3339Nano))
+		return feedback, err
+	}
 	_, err = db.sql.ExecContext(ctx, `INSERT INTO profile_feedback (profile_id, item_id, action, target_value, created_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(profile_id, item_id, action) DO UPDATE SET
@@ -664,7 +986,11 @@ func (db *DB) RemoveFeedbackForProfile(ctx context.Context, profileID string, it
 	if !action.Valid() {
 		return false, fmt.Errorf("不支持的反馈操作 %q", action)
 	}
-	result, err := db.sql.ExecContext(ctx, `DELETE FROM profile_feedback WHERE profile_id = ? AND item_id = ? AND action = ?`, normalizeProfileID(profileID), itemID, action)
+	table := "profile_feedback"
+	if isPreferenceSignal(action) {
+		table = "profile_feedback_signals"
+	}
+	result, err := db.sql.ExecContext(ctx, `DELETE FROM `+table+` WHERE profile_id = ? AND item_id = ? AND action = ?`, normalizeProfileID(profileID), itemID, action)
 	if err != nil {
 		return false, err
 	}
@@ -729,7 +1055,37 @@ func (db *DB) ListFeedbackForProfile(ctx context.Context, profileID string, acti
 		entry.CreatedAt = parseTime(createdRaw)
 		feedback = append(feedback, entry)
 	}
-	return feedback, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	signalRows, err := db.sql.QueryContext(ctx, `SELECT f.item_id, f.action, f.created_at,
+		COALESCE(i.title, ''), COALESCE(i.link, ''), COALESCE(i.feed_name, '')
+		FROM profile_feedback_signals f LEFT JOIN items i ON i.id = f.item_id
+		WHERE f.profile_id = ? AND (? = '' OR f.action = ?) ORDER BY f.created_at DESC`, normalizeProfileID(profileID), action, action)
+	if err != nil {
+		return nil, err
+	}
+	defer signalRows.Close()
+	for signalRows.Next() {
+		var entry Feedback
+		var createdRaw string
+		if err := signalRows.Scan(&entry.ItemID, &entry.Action, &createdRaw, &entry.Title, &entry.Link, &entry.FeedName); err != nil {
+			return nil, err
+		}
+		entry.TargetValue = entry.ItemID
+		entry.CreatedAt = parseTime(createdRaw)
+		feedback = append(feedback, entry)
+	}
+	return feedback, signalRows.Err()
+}
+
+func isPreferenceSignal(action FeedbackAction) bool {
+	switch action {
+	case FeedbackTooShallow, FeedbackTooTheoretical, FeedbackTooMarketing, FeedbackUnusable, FeedbackMoreLikeThis:
+		return true
+	default:
+		return false
+	}
 }
 
 func (db *DB) FeedbackFilters(ctx context.Context) (FeedbackFilters, error) {
@@ -849,8 +1205,8 @@ func (db *DB) DigestItemsForProfile(ctx context.Context, profileID string, profi
 	if limit <= 0 {
 		limit = 100
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > 5000 {
+		limit = 5000
 	}
 	profileID = normalizeProfileID(profileID)
 	rows, err := db.sql.QueryContext(ctx, `SELECT
@@ -938,6 +1294,286 @@ func (db *DB) DigestItemsForProfile(ctx context.Context, profileID string, profi
 		items[i].Feedback = byItem[items[i].ID]
 	}
 	return items, nil
+}
+
+func (db *DB) DigestItemsByIDsForProfile(ctx context.Context, profileID, profileHash string, ids []string) ([]DigestItem, error) {
+	if len(ids) == 0 {
+		return []DigestItem{}, nil
+	}
+	all, err := db.DigestItemsForProfile(ctx, profileID, profileHash, 5000)
+	if err != nil {
+		return nil, err
+	}
+	wanted := map[string]bool{}
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	out := make([]DigestItem, 0, len(ids))
+	for _, item := range all {
+		if wanted[item.ID] {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+func (db *DB) EnqueueAnalysis(ctx context.Context, runID int64, profileID, profileHash, promptVersion string, item rss.Item, priority int) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var runValue any
+	if runID > 0 {
+		runValue = runID
+	}
+	result, err := db.sql.ExecContext(ctx, `INSERT INTO analysis_tasks
+		(run_id, profile_id, profile_hash, item_id, content_hash, prompt_version, priority, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+		ON CONFLICT(item_id, profile_hash, content_hash, prompt_version) DO UPDATE SET
+			priority = MAX(priority, excluded.priority),
+			run_id = excluded.run_id,
+			status = CASE WHEN analysis_tasks.status IN ('completed', 'running') THEN analysis_tasks.status ELSE 'pending' END,
+			next_retry_at = CASE WHEN analysis_tasks.status = 'retry_wait' THEN NULL ELSE analysis_tasks.next_retry_at END,
+			updated_at = excluded.updated_at`,
+		runValue, normalizeProfileID(profileID), profileHash, item.StableID(), item.ContentHash(), promptVersion, priority, now, now)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+func (db *DB) PromoteAnalysis(ctx context.Context, profileID, profileHash, itemID string, priority int) error {
+	_, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET priority = MAX(priority, ?),
+		status = CASE WHEN status = 'retry_wait' THEN 'pending' ELSE status END,
+		next_retry_at = CASE WHEN status = 'retry_wait' THEN NULL ELSE next_retry_at END,
+		updated_at = ? WHERE profile_id = ? AND profile_hash = ? AND item_id = ? AND status NOT IN ('completed', 'failed')`,
+		priority, time.Now().UTC().Format(time.RFC3339Nano), normalizeProfileID(profileID), profileHash, itemID)
+	return err
+}
+
+func (db *DB) RecoverAnalysisTasks(ctx context.Context, staleBefore time.Time) error {
+	_, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET status = 'pending', updated_at = ?
+		WHERE status = 'running' AND updated_at < ?`, time.Now().UTC().Format(time.RFC3339Nano), staleBefore.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (db *DB) ClaimAnalysisTasks(ctx context.Context, profileID string, limit int) ([]AnalysisTask, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	now := time.Now().UTC()
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(run_id,0), profile_id, profile_hash, item_id, content_hash, priority, status, attempts,
+		COALESCE(next_retry_at, ''), COALESCE(last_error, '') FROM analysis_tasks
+		WHERE profile_id = ? AND (status = 'pending' OR (status = 'retry_wait' AND next_retry_at <= ?))
+		ORDER BY priority DESC, created_at ASC LIMIT ?`, normalizeProfileID(profileID), now.Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	var tasks []AnalysisTask
+	for rows.Next() {
+		var task AnalysisTask
+		var retry string
+		if err := rows.Scan(&task.ID, &task.RunID, &task.ProfileID, &task.ProfileHash, &task.ItemID, &task.ContentHash, &task.Priority, &task.Status, &task.Attempts, &retry, &task.LastError); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		task.NextRetryAt = parseTime(retry)
+		tasks = append(tasks, task)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, task := range tasks {
+		if _, err := tx.ExecContext(ctx, `UPDATE analysis_tasks SET status = 'running', updated_at = ? WHERE id = ?`, now.Format(time.RFC3339Nano), task.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func (db *DB) CompleteAnalysisTasks(ctx context.Context, ids []int64) error {
+	return db.setTaskState(ctx, ids, "completed", "", time.Time{}, false)
+}
+
+func (db *DB) CompleteAnalysisItems(ctx context.Context, profileHash string, items []rss.Item) error {
+	for _, item := range items {
+		if _, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET status = 'completed', last_error = '', next_retry_at = NULL, updated_at = ?
+			WHERE profile_hash = ? AND item_id = ? AND content_hash = ?`, time.Now().UTC().Format(time.RFC3339Nano), profileHash, item.StableID(), item.ContentHash()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) RetryAnalysisTasks(ctx context.Context, ids []int64, message string, retryAt time.Time, countAttempt bool) error {
+	return db.setTaskState(ctx, ids, "retry_wait", message, retryAt, countAttempt)
+}
+
+func (db *DB) FailAnalysisTasks(ctx context.Context, ids []int64, message string) error {
+	return db.setTaskState(ctx, ids, "failed", message, time.Time{}, true)
+}
+
+func (db *DB) setTaskState(ctx context.Context, ids []int64, status, message string, retryAt time.Time, countAttempt bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	query := `UPDATE analysis_tasks SET status = ?, last_error = ?, next_retry_at = ?, updated_at = ?, attempts = attempts + ? WHERE id IN (` + placeholders + `)`
+	retry := ""
+	if !retryAt.IsZero() {
+		retry = retryAt.UTC().Format(time.RFC3339Nano)
+	}
+	args := []any{status, message, retry, time.Now().UTC().Format(time.RFC3339Nano), boolInt(countAttempt)}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := db.sql.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (db *DB) AnalysisQueueStats(ctx context.Context, profileID string) (AnalysisQueueStats, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT status,CASE WHEN lower(COALESCE(last_error,'')) LIKE '%429%' OR lower(COALESCE(last_error,'')) LIKE '%rate limit%' OR lower(COALESCE(last_error,'')) LIKE '%too many requests%' THEN 1 ELSE 0 END AS limited,COUNT(*) FROM analysis_tasks WHERE profile_id = ? GROUP BY status,limited`, normalizeProfileID(profileID))
+	if err != nil {
+		return AnalysisQueueStats{}, err
+	}
+	defer rows.Close()
+	var stats AnalysisQueueStats
+	for rows.Next() {
+		var status string
+		var count, limited int
+		if err := rows.Scan(&status, &limited, &count); err != nil {
+			return stats, err
+		}
+		switch status {
+		case "completed":
+			stats.Completed = count
+		case "pending":
+			stats.Pending = count
+		case "running":
+			stats.Running = count
+		case "retry_wait":
+			if limited != 0 {
+				stats.RateLimited += count
+			} else {
+				stats.Retrying += count
+			}
+		case "failed":
+			stats.Failed = count
+		}
+	}
+	return stats, rows.Err()
+}
+
+func (db *DB) CreateAnalysisRun(ctx context.Context, profileID, status string) (int64, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := db.sql.ExecContext(ctx, `INSERT INTO analysis_runs(profile_id,status,created_at,updated_at) VALUES(?,?,?,?)`, normalizeProfileID(profileID), status, now, now)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (db *DB) SetAnalysisRunTotals(ctx context.Context, runID int64, total, cached int, status string) error {
+	_, err := db.sql.ExecContext(ctx, `UPDATE analysis_runs SET total=?, cached=?, status=?, updated_at=? WHERE id=?`, total, cached, status, time.Now().UTC().Format(time.RFC3339Nano), runID)
+	return err
+}
+
+func (db *DB) SetAnalysisRunStatus(ctx context.Context, runID int64, status string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	completed := any(nil)
+	if status == "completed" || status == "partial_failed" {
+		completed = now
+	}
+	_, err := db.sql.ExecContext(ctx, `UPDATE analysis_runs SET status=?, completed_at=COALESCE(?,completed_at), updated_at=? WHERE id=?`, status, completed, now, runID)
+	return err
+}
+
+func (db *DB) EnsureRecoveryRun(ctx context.Context, profileID string) (int64, error) {
+	profileID = normalizeProfileID(profileID)
+	if _, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET status='pending', updated_at=? WHERE profile_id=? AND status='running'`, time.Now().UTC().Format(time.RFC3339Nano), profileID); err != nil {
+		return 0, err
+	}
+	if _, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET status='pending',attempts=0,next_retry_at=NULL,updated_at=? WHERE profile_id=? AND status='failed' AND last_error LIKE '%score%0-10%'`, time.Now().UTC().Format(time.RFC3339Nano), profileID); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_tasks WHERE profile_id=? AND run_id IS NULL`, profileID).Scan(&count); err != nil || count == 0 {
+		return 0, err
+	}
+	runID, err := db.CreateAnalysisRun(ctx, profileID, "background")
+	if err != nil {
+		return 0, err
+	}
+	if _, err := db.sql.ExecContext(ctx, `UPDATE analysis_tasks SET run_id=? WHERE profile_id=? AND run_id IS NULL`, runID, profileID); err != nil {
+		return 0, err
+	}
+	if err := db.SetAnalysisRunTotals(ctx, runID, count, 0, "background"); err != nil {
+		return 0, err
+	}
+	return runID, nil
+}
+
+func (db *DB) CurrentAnalysisRun(ctx context.Context, profileID string) (AnalysisRun, bool, error) {
+	var run AnalysisRun
+	var created, completed string
+	err := db.sql.QueryRowContext(ctx, `SELECT id,profile_id,status,total,cached,created_at,COALESCE(completed_at,'') FROM analysis_runs WHERE profile_id=? ORDER BY CASE WHEN status IN ('initial','background','rate_limited') THEN 0 ELSE 1 END, created_at DESC LIMIT 1`, normalizeProfileID(profileID)).Scan(&run.ID, &run.ProfileID, &run.Status, &run.Total, &run.Cached, &created, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return run, false, nil
+	}
+	if err != nil {
+		return run, false, err
+	}
+	run.CreatedAt = parseTime(created)
+	run.CompletedAt = parseTime(completed)
+	rows, err := db.sql.QueryContext(ctx, `SELECT status,CASE WHEN lower(COALESCE(last_error,'')) LIKE '%429%' OR lower(COALESCE(last_error,'')) LIKE '%rate limit%' OR lower(COALESCE(last_error,'')) LIKE '%too many requests%' THEN 1 ELSE 0 END AS limited,COUNT(*) FROM analysis_tasks WHERE run_id=? GROUP BY status,limited`, run.ID)
+	if err != nil {
+		return run, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var limited, count int
+		if err := rows.Scan(&status, &limited, &count); err != nil {
+			return run, false, err
+		}
+		switch status {
+		case "completed":
+			run.Analyzed += count
+		case "pending":
+			run.Pending += count
+		case "running":
+			run.Running += count
+		case "retry_wait":
+			if limited != 0 {
+				run.RateLimited += count
+			} else {
+				run.Retrying += count
+			}
+		case "failed":
+			run.Failed += count
+		}
+	}
+	run.Analyzed += run.Cached
+	active := run.Pending + run.Running + run.Retrying + run.RateLimited
+	if active == 0 && run.Status != "completed" && run.Status != "partial_failed" {
+		if run.Failed > 0 {
+			run.Status = "partial_failed"
+		} else {
+			run.Status = "completed"
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_, _ = db.sql.ExecContext(ctx, `UPDATE analysis_runs SET status=?,completed_at=?,updated_at=? WHERE id=?`, run.Status, now, now, run.ID)
+		run.CompletedAt = time.Now().UTC()
+	} else if run.RateLimited > 0 {
+		run.Status = "rate_limited"
+	}
+	return run, true, rows.Err()
 }
 
 func (db *DB) RecordCostEvent(ctx context.Context, event CostEvent) error {

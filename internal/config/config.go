@@ -25,6 +25,8 @@ type Config struct {
 	Budget   Budget                   `yaml:"budget"`
 	Push     Push                     `yaml:"push"`
 	Feeds    []Feed                   `yaml:"feeds"`
+	X        XConfig                  `yaml:"x,omitempty"`
+	Digest   DigestConfig             `yaml:"digest,omitempty"`
 	State    StateConfig              `yaml:"state,omitempty"`
 	Profiles map[string]ProfileConfig `yaml:"profiles,omitempty"`
 }
@@ -37,6 +39,7 @@ type ProfileConfig struct {
 	Budget   Budget    `yaml:"budget,omitempty"`
 	Push     Push      `yaml:"push,omitempty"`
 	Feeds    []Feed    `yaml:"feeds,omitempty"`
+	X        XConfig   `yaml:"x,omitempty"`
 }
 
 type Profile struct {
@@ -73,17 +76,22 @@ type ModelPool struct {
 }
 
 type Settings struct {
-	Interval            string `yaml:"interval"`
-	HTTPTimeout         string `yaml:"http_timeout"`
-	LookbackHours       int    `yaml:"lookback_hours"`
-	MaxItemsPerFeed     int    `yaml:"max_items_per_feed"`
-	BatchSize           int    `yaml:"batch_size"`
-	MinScore            int    `yaml:"min_score"`
-	MaxPushes           int    `yaml:"max_pushes"`
-	MaxCandidatesPerRun *int   `yaml:"max_candidates_per_run"`
-	AnalysisCacheTTL    string `yaml:"analysis_cache_ttl"`
-	FullTextMinChars    int    `yaml:"full_text_min_chars"`
-	FullTextMaxChars    int    `yaml:"full_text_max_chars"`
+	Interval              string `yaml:"interval"`
+	HTTPTimeout           string `yaml:"http_timeout"`
+	LookbackHours         int    `yaml:"lookback_hours"`
+	MaxItemsPerFeed       int    `yaml:"max_items_per_feed"`
+	BatchSize             int    `yaml:"batch_size"`
+	MinScore              int    `yaml:"min_score"`
+	MaxPushes             int    `yaml:"max_pushes"`
+	MaxCandidatesPerRun   *int   `yaml:"max_candidates_per_run"`
+	AnalysisCacheTTL      string `yaml:"analysis_cache_ttl"`
+	AnalysisPromptVersion string `yaml:"analysis_prompt_version,omitempty"`
+	FullTextMinChars      int    `yaml:"full_text_min_chars"`
+	FullTextMaxChars      int    `yaml:"full_text_max_chars"`
+	InitialItemsPerFeed   int    `yaml:"initial_items_per_feed,omitempty"`
+	AnalysisRPM           int    `yaml:"analysis_rpm,omitempty"`
+	AnalysisTPM           int    `yaml:"analysis_tpm,omitempty"`
+	InitialTokenBudget    int    `yaml:"initial_token_budget,omitempty"`
 }
 
 type Database struct {
@@ -107,6 +115,12 @@ type Push struct {
 	DingTalk      WebhookPush  `yaml:"dingtalk,omitempty"`
 	Telegram      TelegramPush `yaml:"telegram,omitempty"`
 	Email         EmailPush    `yaml:"email,omitempty"`
+}
+
+type DigestConfig struct {
+	Times       []string `yaml:"times,omitempty"`
+	DailyLimit  int      `yaml:"daily_limit,omitempty"`
+	PerRunLimit int      `yaml:"per_run_limit,omitempty"`
 }
 
 type WebhookPush struct {
@@ -139,6 +153,21 @@ type Feed struct {
 	URL      string   `yaml:"url"`
 	Tags     []string `yaml:"tags"`
 	Disabled bool     `yaml:"disabled"`
+}
+
+type XConfig struct {
+	BaseURL        string    `yaml:"base_url,omitempty"`
+	BearerToken    string    `yaml:"bearer_token,omitempty"`
+	BearerTokenEnv string    `yaml:"bearer_token_env,omitempty"`
+	Searches       []XSearch `yaml:"searches,omitempty"`
+}
+
+type XSearch struct {
+	Name       string   `yaml:"name"`
+	Query      string   `yaml:"query"`
+	Tags       []string `yaml:"tags,omitempty"`
+	MaxResults int      `yaml:"max_results,omitempty"`
+	Disabled   bool     `yaml:"disabled,omitempty"`
 }
 
 type StateConfig struct {
@@ -198,7 +227,16 @@ func (c *Config) ApplyDefaults() {
 		c.Models.Fallback[i] = applyModelDefaults(c.Models.Fallback[i])
 	}
 	if c.Settings.Interval == "" {
-		c.Settings.Interval = "30m"
+		c.Settings.Interval = "1h"
+	}
+	if len(c.Digest.Times) == 0 {
+		c.Digest.Times = []string{"08:00", "20:00"}
+	}
+	if c.Digest.DailyLimit == 0 {
+		c.Digest.DailyLimit = 12
+	}
+	if c.Digest.PerRunLimit == 0 {
+		c.Digest.PerRunLimit = 6
 	}
 	if c.Settings.HTTPTimeout == "" {
 		c.Settings.HTTPTimeout = "20s"
@@ -219,13 +257,41 @@ func (c *Config) ApplyDefaults() {
 		c.Settings.MaxPushes = 8
 	}
 	if c.Settings.AnalysisCacheTTL == "" {
-		c.Settings.AnalysisCacheTTL = "168h"
+		c.Settings.AnalysisCacheTTL = "24h"
+	}
+	if c.Settings.AnalysisPromptVersion == "" {
+		c.Settings.AnalysisPromptVersion = "ai-frontier-v2"
 	}
 	if c.Settings.FullTextMinChars == 0 {
 		c.Settings.FullTextMinChars = 600
 	}
 	if c.Settings.FullTextMaxChars == 0 {
 		c.Settings.FullTextMaxChars = 8000
+	}
+	if c.Settings.InitialItemsPerFeed == 0 {
+		c.Settings.InitialItemsPerFeed = 10
+	}
+	if c.Settings.AnalysisRPM == 0 {
+		c.Settings.AnalysisRPM = 400
+	}
+	if c.Settings.AnalysisTPM == 0 {
+		c.Settings.AnalysisTPM = 800000
+	}
+	if c.Settings.InitialTokenBudget == 0 {
+		c.Settings.InitialTokenBudget = 700000
+	}
+	if len(c.X.Searches) > 0 {
+		if c.X.BaseURL == "" {
+			c.X.BaseURL = "https://api.x.com/2"
+		}
+		if c.X.BearerTokenEnv == "" {
+			c.X.BearerTokenEnv = "X_BEARER_TOKEN"
+		}
+		for i := range c.X.Searches {
+			if c.X.Searches[i].MaxResults == 0 {
+				c.X.Searches[i].MaxResults = 20
+			}
+		}
 	}
 	if c.Database.Path == "" {
 		c.Database.Path = ".rss-agent/rss-agent.db"
@@ -279,6 +345,17 @@ func (c *Config) validateSingle() error {
 			return fmt.Errorf("feeds[%d].url 不能为空", i)
 		}
 	}
+	for i, search := range c.X.Searches {
+		if strings.TrimSpace(search.Name) == "" {
+			return fmt.Errorf("x.searches[%d].name cannot be empty", i)
+		}
+		if strings.TrimSpace(search.Query) == "" {
+			return fmt.Errorf("x.searches[%d].query cannot be empty", i)
+		}
+		if search.MaxResults < 10 || search.MaxResults > 100 {
+			return fmt.Errorf("x.searches[%d].max_results must be between 10 and 100", i)
+		}
+	}
 	if c.Settings.MaxCandidatesPerRun != nil && *c.Settings.MaxCandidatesPerRun < 0 {
 		return errors.New("settings.max_candidates_per_run cannot be negative")
 	}
@@ -287,6 +364,17 @@ func (c *Config) validateSingle() error {
 	}
 	if c.Settings.FullTextMinChars > c.Settings.FullTextMaxChars {
 		return errors.New("settings.full_text_max_chars must be greater than or equal to full_text_min_chars")
+	}
+	if c.Digest.DailyLimit < 1 || c.Digest.DailyLimit > 50 {
+		return errors.New("digest.daily_limit must be between 1 and 50")
+	}
+	if c.Digest.PerRunLimit < 1 || c.Digest.PerRunLimit > c.Digest.DailyLimit {
+		return errors.New("digest.per_run_limit must be positive and not exceed daily_limit")
+	}
+	for _, digestTime := range c.Digest.Times {
+		if _, err := time.Parse("15:04", digestTime); err != nil {
+			return fmt.Errorf("invalid digest time %q; use HH:MM", digestTime)
+		}
 	}
 	if err := c.validatePush(); err != nil {
 		return err
@@ -352,6 +440,9 @@ func (c *Config) ResolveProfile(name string) (*Config, error) {
 		resolved.Budget = profile.Budget
 		resolved.Push = profile.Push
 		resolved.Feeds = append([]Feed(nil), profile.Feeds...)
+		if hasProfileX(profile) {
+			resolved.X = copyXConfig(profile.X)
+		}
 		if hasProfileModels(profile) {
 			resolved.Model = profile.Model
 			resolved.Models = copyModelPool(profile.Models)
@@ -368,6 +459,7 @@ func copyConfig(c *Config) Config {
 	clone := *c
 	clone.Feeds = append([]Feed(nil), c.Feeds...)
 	clone.Models = copyModelPool(c.Models)
+	clone.X = copyXConfig(c.X)
 	return clone
 }
 
@@ -380,6 +472,18 @@ func hasProfileModels(profile ProfileConfig) bool {
 	return !isZeroModel(profile.Model) || !isZeroModel(profile.Models.Primary) || len(profile.Models.Fallback) > 0
 }
 
+func hasProfileX(profile ProfileConfig) bool {
+	return profile.X.BaseURL != "" || profile.X.BearerToken != "" || profile.X.BearerTokenEnv != "" || len(profile.X.Searches) > 0
+}
+
+func copyXConfig(source XConfig) XConfig {
+	source.Searches = append([]XSearch(nil), source.Searches...)
+	for i := range source.Searches {
+		source.Searches[i].Tags = append([]string(nil), source.Searches[i].Tags...)
+	}
+	return source
+}
+
 func (c *Config) Interval() time.Duration {
 	return mustDuration(c.Settings.Interval, 30*time.Minute)
 }
@@ -389,7 +493,7 @@ func (c *Config) HTTPTimeout() time.Duration {
 }
 
 func (c *Config) AnalysisCacheTTL() time.Duration {
-	return mustDuration(c.Settings.AnalysisCacheTTL, 168*time.Hour)
+	return mustDuration(c.Settings.AnalysisCacheTTL, 24*time.Hour)
 }
 
 func (s Settings) CandidateLimit() int {
@@ -407,7 +511,26 @@ func (c *Config) DatabasePath() string {
 }
 
 func (c *Config) ProfileHash() string {
-	data, _ := json.Marshal(c.Profile)
+	type modelIdentity struct {
+		Label    string `json:"label"`
+		Provider string `json:"provider"`
+		BaseURL  string `json:"base_url"`
+		Name     string `json:"name"`
+	}
+	identities := make([]modelIdentity, 0, len(c.ModelCandidates()))
+	for _, model := range c.ModelCandidates() {
+		if isDisabled(model) {
+			continue
+		}
+		model = applyModelDefaults(model)
+		identities = append(identities, modelIdentity{Label: model.Label, Provider: model.Provider, BaseURL: model.BaseURL, Name: model.Name})
+	}
+	payload := struct {
+		Profile       Profile         `json:"profile"`
+		Models        []modelIdentity `json:"models"`
+		PromptVersion string          `json:"prompt_version"`
+	}{Profile: c.Profile, Models: identities, PromptVersion: c.Settings.AnalysisPromptVersion}
+	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])[:16]
 }
@@ -546,6 +669,20 @@ func (c *Config) EnabledFeeds() []Feed {
 		}
 	}
 	return feeds
+}
+
+func (c *Config) EnabledXSearches() []XSearch {
+	searches := make([]XSearch, 0, len(c.X.Searches))
+	for _, search := range c.X.Searches {
+		if !search.Disabled {
+			searches = append(searches, search)
+		}
+	}
+	return searches
+}
+
+func (c *Config) XBearerToken() string {
+	return resolveValue(c.X.BearerToken, c.X.BearerTokenEnv)
 }
 
 func mustDuration(raw string, fallback time.Duration) time.Duration {

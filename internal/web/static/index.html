@@ -27,6 +27,9 @@
           <span id="run-status">本地工作台</span>
         </div>
         <div class="global-bar__actions">
+		  <button id="ingest-trigger" class="shortcut-button" type="button" aria-label="投喂链接">
+			<i data-lucide="link-2"></i><span class="shortcut-button__label">投喂</span>
+		  </button>
           <button id="command-trigger" class="shortcut-button" type="button" aria-label="打开命令面板">
             <i data-lucide="search"></i>
             <span class="shortcut-button__label">命令</span>
@@ -86,7 +89,7 @@
               <p class="eyebrow">QUEUE</p>
               <h1>今日 Digest</h1>
             </div>
-            <div id="digest-meta" class="digest-meta"></div>
+			<div class="digest-history"><select id="edition-select" aria-label="选择历史 Digest"><option value="">当前情报库</option></select><div id="digest-meta" class="digest-meta"></div></div>
           </header>
 
           <div class="digest-tools">
@@ -100,6 +103,17 @@
               <button class="tab" type="button" role="tab" aria-selected="false" data-view="recommended">推荐</button>
               <button class="tab" type="button" role="tab" aria-selected="false" data-view="delivered">已推送</button>
             </div>
+			<label class="topic-filter" for="topic-select">
+			  <span>主题</span>
+			  <select id="topic-select">
+				<option value="">全部</option>
+				<option value="paradigm">新范式</option>
+				<option value="codex">Codex</option>
+				<option value="skills">Skills / MCP</option>
+				<option value="model">模型与基础设施</option>
+				<option value="frontend">前端实践</option>
+			  </select>
+			</label>
           </div>
 
           <div id="digest-list" class="digest-list" role="listbox" aria-label="文章列表" aria-busy="true"></div>
@@ -125,6 +139,17 @@
         <div id="command-list" class="command-list" role="listbox"></div>
       </form>
     </dialog>
+
+	<dialog id="ingest-dialog" class="command-dialog ingest-dialog" aria-label="投喂内容">
+	  <form id="ingest-form" class="command-dialog__surface ingest-form">
+		<header><div><p class="eyebrow">INTEREST SAMPLE</p><h2>投喂内容</h2></div><button class="icon-button" type="button" data-close-ingest aria-label="关闭"><i data-lucide="x"></i></button></header>
+		<label>链接<input name="url" type="url" required placeholder="https://..."></label>
+		<label>标题（页面无法读取时填写）<input name="title" type="text" placeholder="文章或项目标题"></label>
+		<label>正文或补充说明（可选）<textarea name="content" rows="6" placeholder="粘贴正文，或说明为什么希望看到同类内容"></textarea></label>
+		<label>标签（逗号分隔）<input name="tags" type="text" placeholder="loop engineering, codex, mcp"></label>
+		<footer><button class="secondary-button" type="button" data-close-ingest>取消</button><button class="primary-button" type="submit"><i data-lucide="plus"></i><span>加入情报库</span></button></footer>
+	  </form>
+	</dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </body>

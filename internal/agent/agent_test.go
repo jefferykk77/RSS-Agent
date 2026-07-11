@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -52,10 +53,6 @@ func TestParseDecisionsRejectsInvalidSchema(t *testing.T) {
 		{
 			name:    "missing required field",
 			content: `[{"item_id":"abc","score":8,"should_push":true,"title":"T","summary":"S","key_points":["A"],"tags":["go"]}]`,
-		},
-		{
-			name:    "score out of range",
-			content: `[{"item_id":"abc","score":11,"should_push":true,"title":"T","summary":"S","why":"W","key_points":["A"],"tags":["go"]}]`,
 		},
 		{
 			name:    "unknown field",
@@ -109,6 +106,35 @@ func TestAnalyzeFallsBackAfterRetry(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].ModelLabel != "fallback" {
 		t.Fatalf("unexpected results: %+v", results)
+	}
+}
+
+func TestScoreNormalization(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want int
+	}{
+		{`8`, 8}, {`8.6`, 9}, {`"7.4"`, 7}, {`-3`, 0}, {`14`, 10},
+	} {
+		raw := json.RawMessage(`{"item_id":"one","score":` + test.raw + `,"should_push":true,"title":"Title","summary":"Summary","why":"Why","key_points":["Point"],"tags":["tag"]}`)
+		decision, err := validateDecisionSchema(raw)
+		if err != nil {
+			t.Fatalf("score %s: %v", test.raw, err)
+		}
+		if decision.Score != test.want {
+			t.Fatalf("score %s=%d want %d", test.raw, decision.Score, test.want)
+		}
+	}
+}
+
+func TestAnalyzePreservesValidItemsWhenOneItemFails(t *testing.T) {
+	model := &scriptedModel{responses: []string{"[]", "[]", decisionJSON("one"), decisionJSON("wrong"), decisionJSON("wrong")}}
+	results, _, err := NewWithModel(model).AnalyzeWithUsage(context.Background(), config.Profile{}, []rss.Item{{ID: "one", Title: "One"}, {ID: "two", Title: "Two"}}, 2)
+	if err == nil {
+		t.Fatal("error=nil, want partial error")
+	}
+	if len(results) != 1 || results[0].Item.ID != "one" {
+		t.Fatalf("results=%+v", results)
 	}
 }
 

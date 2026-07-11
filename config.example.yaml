@@ -2,23 +2,27 @@ profile:
     language: zh-CN
     timezone: Asia/Shanghai
     interests:
-        - AI Agent、Eino、Go 工程实践、LLM 应用架构
-        - 能直接启发产品设计或开发效率的工具、论文和案例
+        - AI 前沿工程范式、Applied AI Engineering、模型与基础设施
+        - Codex 工作流、Skills、MCP 和能立即尝试的高质量实践
+        - 能被 Codex 直接消费并展示真实效果的前端实践
     must_include: []
     exclude:
         - 纯融资新闻
         - 标题党营销稿
     priority_terms:
-        - Eino
-        - AI Agent
-        - Go
-        - LLM
+        - Codex
+        - loop engineering
+        - harness engineering
+        - context engineering
+        - applied AI engineering
+        - MCP
+        - Skills
     muted_feeds: []
     muted_tags: []
-    notes: 偏好可落地、有技术细节、信息密度高的内容。
+    notes: Coding Agent 只重点追踪 Codex；偏好一手来源、亲身实践、通俗解释和可立即行动的内容。
 models:
     primary:
-        label: ark-deepseek-v3.2
+        label: glm-5.2
         provider: ark
         base_url: https://ark.cn-beijing.volces.com/api/v3
         api_key: ""
@@ -26,7 +30,7 @@ models:
         name: ${ARK_MODEL}
         timeout: 60s
         temperature: 0.2
-        max_tokens: 1200
+        max_tokens: 2400
         input_price_cny_per_million: 0
         output_price_cny_per_million: 0
         free_daily_tokens: 2000000
@@ -44,15 +48,20 @@ models:
           output_price_cny_per_million: 1.9
           free_daily_tokens: 0
 settings:
-    interval: 30m
+    interval: 1h
     http_timeout: 20s
     lookback_hours: 72
     max_items_per_feed: 20
     batch_size: 8
     min_score: 7
-    max_pushes: 8
-    max_candidates_per_run: 24
-    analysis_cache_ttl: 168h
+    max_pushes: 6
+    max_candidates_per_run: 0
+    initial_items_per_feed: 10
+    analysis_rpm: 400
+    analysis_tpm: 800000
+    initial_token_budget: 700000
+    analysis_cache_ttl: 24h
+    analysis_prompt_version: ai-frontier-v2
     full_text_min_chars: 600
     full_text_max_chars: 8000
 database:
@@ -90,13 +99,67 @@ push:
         to: []
         subject: RSS Agent Digest
         start_tls: true
+digest:
+    times:
+        - "08:00"
+        - "20:00"
+    daily_limit: 12
+    per_run_limit: 6
 feeds:
-    - name: Go Blog
-      url: https://go.dev/blog/feed.atom
+    - name: OpenAI News
+      url: https://openai.com/news/rss.xml
       tags:
-        - go
-        - eino
+        - primary
+        - openai
+        - codex
       disabled: false
+    - name: Latent Space
+      url: https://www.latent.space/feed
+      tags:
+        - primary
+        - applied-ai
+        - paradigm
+      disabled: false
+    - name: Reddit · Claude Engineering
+      url: https://www.reddit.com/r/ClaudeCode+ClaudeAI+ClaudeWorkflows/new/.rss
+      tags:
+        - community
+        - claude-code
+        - applied-ai
+      disabled: false
+    - name: Hugging Face Blog
+      url: https://huggingface.co/blog/feed.xml
+      tags:
+        - primary
+        - model-infra
+        - applied-ai
+      disabled: false
+    - name: Google DeepMind
+      url: https://deepmind.google/blog/rss.xml
+      tags:
+        - primary
+        - research
+        - model-infra
+      disabled: false
+    - name: HN · AI Engineering
+      url: https://hnrss.org/newest?q=%22AI+agent%22+OR+%22loop+engineering%22+OR+%22harness+engineering%22+OR+%22context+engineering%22
+      tags:
+        - community
+        - paradigm
+        - applied-ai
+      disabled: false
+x:
+    base_url: https://api.x.com/2
+    bearer_token: ""
+    bearer_token_env: X_BEARER_TOKEN
+    searches:
+        - name: X AI · Research & Builders
+          query: '(AI OR "AI agent" OR LLM OR "foundation model") lang:en -is:retweet'
+          tags:
+              - ai
+              - x
+          max_results: 20
+          disabled: true
 state:
     path: .rss-agent/state.json
 profiles:

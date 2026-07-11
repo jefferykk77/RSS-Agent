@@ -10,7 +10,16 @@ const state = {
   collectionFilter: "all",
   view: "all",
   sourceFilter: "",
+	 topic: "",
+  sourceStates: [],
+	 editions: [],
+	 edition: "",
   loading: false,
+  loadingMore: false,
+  nextCursor: "",
+  run: { status: "idle", analyzed: 0, pending: 0, running: 0, retrying: 0, rate_limited: 0, failed: 0 },
+  pollingActive: true,
+  lastBackgroundPoll: 0,
 };
 
 const elements = {
@@ -33,6 +42,11 @@ const elements = {
   commandSearch: document.querySelector("#command-search"),
   commandList: document.querySelector("#command-list"),
   toast: document.querySelector("#toast"),
+	 topicSelect: document.querySelector("#topic-select"),
+	 ingestTrigger: document.querySelector("#ingest-trigger"),
+	 ingestDialog: document.querySelector("#ingest-dialog"),
+  ingestForm: document.querySelector("#ingest-form"),
+	 editionSelect: document.querySelector("#edition-select"),
 };
 
 let toastTimer;
@@ -55,33 +69,99 @@ async function loadWorkspace(profile = state.profile, selectedID = state.selecte
   elements.digestList.replaceChildren(loadingState());
   try {
     const query = new URLSearchParams({ profile });
-    const [bootstrap, digest] = await Promise.all([
+	if (state.edition) query.set("edition", state.edition);
+    const [bootstrap, digest, sourceStates, editions, run] = await Promise.all([
       request(`/api/bootstrap?${query}`),
-      request(`/api/digest?${query}&limit=100`),
+	  request(`/api/digest?${query}&limit=30&order=${state.view === "recommended" ? "recommended" : "newest"}`),
+	  request("/api/sources/health"),
+	  request(`/api/editions?profile=${encodeURIComponent(profile)}`),
+	  request(`/api/analysis-runs/current?profile=${encodeURIComponent(profile)}`),
     ]);
     state.profile = bootstrap.profile;
     state.profiles = bootstrap.profiles;
     state.feeds = bootstrap.feeds;
-    state.items = digest.items;
+    state.items = Array.isArray(digest.items) ? digest.items.map(normalizeItem) : [];
+	state.sourceStates = Array.isArray(sourceStates) ? sourceStates : [];
+	state.editions = Array.isArray(editions) ? editions : [];
+	state.run = run || state.run;
+	state.pollingActive = !["completed", "partial_failed", "idle"].includes(state.run.status);
+	state.nextCursor = digest.next_cursor || "";
     state.selectedID = state.items.some((item) => item.id === selectedID) ? selectedID : state.items[0]?.id || "";
     renderWorkspace();
-    elements.runStatus.textContent = "本地工作台";
   } catch (error) {
     elements.digestList.replaceChildren(emptyState(error.message));
-    elements.runStatus.textContent = "连接失败";
+    elements.runStatus.textContent = "加载失败";
     showToast(error.message, true);
   } finally {
     state.loading = false;
   }
 }
 
+async function loadMoreItems() {
+  if (state.loading || state.loadingMore || !state.nextCursor || state.edition) return;
+  state.loadingMore = true;
+  try {
+    const query = new URLSearchParams({ profile: state.profile, limit: "30", cursor: state.nextCursor, order: state.view === "recommended" ? "recommended" : "newest" });
+    const digest = await request(`/api/digest?${query}`);
+    const incoming = (digest.items || []).map(normalizeItem);
+    const known = new Set(state.items.map((item) => item.id));
+    state.items.push(...incoming.filter((item) => !known.has(item.id)));
+    state.nextCursor = digest.next_cursor || "";
+    renderWorkspace();
+    const pending = incoming.filter((item) => item.analysis_status !== "completed").map((item) => item.id);
+    if (pending.length) {
+      await request(`/api/analysis-queue?profile=${encodeURIComponent(state.profile)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ item_ids: pending }) });
+	  state.pollingActive = true;
+    }
+  } catch (error) { showToast(error.message, true); }
+  finally { state.loadingMore = false; }
+}
+
+async function refreshAnalysis() {
+  if (!state.pollingActive) return;
+  if (document.hidden && Date.now() - state.lastBackgroundPoll < 15000) return;
+  state.lastBackgroundPoll = Date.now();
+  try {
+    const rows = [...elements.digestList.querySelectorAll(".digest-row[data-item-id]")];
+    const visible = rows.filter((row) => row.offsetTop + row.offsetHeight >= elements.digestList.scrollTop && row.offsetTop <= elements.digestList.scrollTop + elements.digestList.clientHeight).map((row) => row.dataset.itemId);
+    if (state.selectedID && !visible.includes(state.selectedID)) visible.push(state.selectedID);
+    const query = new URLSearchParams({ profile: state.profile });
+    for (const id of visible.slice(0, 100)) query.append("item_id", id);
+    const [run, updates] = await Promise.all([request(`/api/analysis-runs/current?profile=${encodeURIComponent(state.profile)}`), visible.length ? request(`/api/digest/updates?${query}`) : Promise.resolve({ items: [] })]);
+    state.run = run;
+    const byID = new Map((updates.items || []).map((item) => [item.id, normalizeItem(item)]));
+    let changed = false;
+    state.items = state.items.map((item) => { const update = byID.get(item.id); if (!update) return item; if (update.analyzed_at !== item.analyzed_at || update.analysis_status !== item.analysis_status) { changed = true; return update; } return item; });
+    if (changed) { const top = elements.digestList.scrollTop; renderDigest(); elements.digestList.scrollTop = top; renderDetail(); }
+    state.pollingActive = !["completed", "partial_failed", "idle"].includes(run.status);
+    renderNavigation();
+  } catch (_) {}
+}
+
 function renderWorkspace() {
   renderProfiles();
+	renderEditions();
   renderSources();
   renderNavigation();
   renderDigest();
   renderDetail();
   refreshIcons();
+}
+
+function renderEditions() {
+	elements.editionSelect.replaceChildren();
+	const current = document.createElement("option");
+	current.value = "";
+	current.textContent = "当前情报库";
+	elements.editionSelect.append(current);
+	for (const edition of state.editions) {
+		const option = document.createElement("option");
+		option.value = String(edition.id);
+		const slot = { morning: "早报", evening: "晚报", manual: "手动" }[edition.slot] || edition.slot;
+		option.textContent = `${new Date(edition.created_at).toLocaleDateString("zh-CN")} ${slot} · ${edition.item_ids.length} 条`;
+		option.selected = option.value === state.edition;
+		elements.editionSelect.append(option);
+	}
 }
 
 function renderProfiles() {
@@ -101,14 +181,16 @@ function renderSources() {
   allSources.querySelector(".source-item").classList.toggle("is-active", !state.sourceFilter);
   elements.sourceList.append(allSources);
   for (const feed of state.feeds) {
-    const button = makeSourceButton(feed.url, feed.name, feed.disabled ? "circle-off" : "rss");
+	const health = state.sourceStates.find((entry) => entry.url === feed.url);
+    const button = makeSourceButton(feed.url, feed.name, feed.disabled ? "circle-off" : health?.fail_count ? "circle-alert" : "rss");
     const sourceButton = button.querySelector(".source-item");
     sourceButton.classList.toggle("is-active", feed.url === state.sourceFilter);
     sourceButton.disabled = feed.disabled;
     elements.sourceList.append(button);
   }
   const enabled = state.feeds.filter((feed) => !feed.disabled).length;
-  elements.sourceHealth.replaceChildren(icon("radio"), document.createTextNode(` ${enabled} 个启用来源`));
+	const failed = state.sourceStates.filter((entry) => entry.fail_count > 0).length;
+  elements.sourceHealth.replaceChildren(icon(failed ? "circle-alert" : "radio"), document.createTextNode(` ${enabled} 个启用来源${failed ? ` · ${failed} 个异常` : ""}`));
 }
 
 function makeSourceButton(url, name, iconName) {
@@ -129,7 +211,11 @@ function makeSourceButton(url, name, iconName) {
 function renderNavigation() {
   const filtered = filteredItems();
   elements.digestCount.textContent = String(filtered.length);
-  elements.digestMeta.textContent = state.items.length ? `${state.items.length} 条已保存条目` : "等待首次运行";
+	const pending = (state.run.pending || 0) + (state.run.running || 0) + (state.run.retrying || 0);
+	const progress = `已分析 ${state.run.analyzed || 0} / 待分析 ${pending}${state.run.rate_limited ? ` / 等待额度 ${state.run.rate_limited}` : ""}${state.run.failed ? ` / 失败 ${state.run.failed}` : ""}`;
+  elements.digestMeta.textContent = state.items.length ? `${state.items.length} 条已加载 · ${progress}` : "等待首次运行";
+	const labels = { initial: "首批分析中", background: "后台分析中", rate_limited: "等待模型额度", completed: "运行完成", partial_failed: "部分完成", idle: "本地工作台" };
+	if (!state.loading) elements.runStatus.textContent = labels[state.run.status] || "本地工作台";
   for (const button of document.querySelectorAll(".nav-item[data-filter]")) {
     button.classList.toggle("is-active", button.dataset.filter === state.collectionFilter);
   }
@@ -158,13 +244,13 @@ function makeDigestRow(item) {
   row.type = "button";
   row.className = "digest-row";
   row.setAttribute("role", "option");
-  row.dataset.itemID = item.id;
+  row.dataset.itemId = item.id;
   row.setAttribute("aria-selected", String(item.id === state.selectedID));
   row.classList.toggle("is-selected", item.id === state.selectedID);
 
   const score = document.createElement("span");
   score.className = "score";
-  score.textContent = item.score ? String(item.score) : "-";
+  score.textContent = item.analysis_status === "completed" ? String(item.score) : "…";
   score.classList.toggle("is-recommended", item.should_push);
   row.append(score);
 
@@ -187,7 +273,7 @@ function makeDigestRow(item) {
 
   const summary = document.createElement("span");
   summary.className = "digest-row__summary";
-  summary.textContent = firstText(item.summary, item.source_summary, item.why, "尚未生成摘要");
+  summary.textContent = item.analysis_status === "completed" ? firstText(item.summary, item.source_summary, item.why, "尚未生成摘要") : "等待分析，原文已保存";
   body.append(summary);
 
   const meta = document.createElement("span");
@@ -226,6 +312,10 @@ function renderDetail() {
   if (!item) {
     return;
   }
+	if (elements.detailPane.dataset.renderedItemId !== item.id) {
+	  elements.detailPane.scrollTop = 0;
+	  elements.detailPane.dataset.renderedItemId = item.id;
+	}
 
   const article = elements.detailContent;
   article.replaceChildren();
@@ -285,12 +375,33 @@ function renderDetail() {
     feedbackIconButton(item, "later", "clock-3", "稍后阅读"),
     feedbackIconButton(item, "block", "ban", "屏蔽这篇"),
   );
+	const preferenceFeedback = document.createElement("div");
+	preferenceFeedback.className = "preference-feedback";
+	for (const [action, label] of [["more-like-this", "希望看同类"], ["too-shallow", "太浅"], ["too-theoretical", "太理论"], ["too-marketing", "太营销"], ["unusable", "无法使用"]]) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "signal-button";
+		button.dataset.action = action;
+		button.dataset.itemId = item.id;
+		button.textContent = label;
+		button.classList.toggle("is-active", item.feedback.includes(action));
+		preferenceFeedback.append(button);
+	}
   actions.append(feedback);
+	actions.append(preferenceFeedback);
+  if (!item.analyzed_at) {
+    const analyze = document.createElement("button");
+    analyze.type = "button";
+    analyze.className = "text-action analyze-action";
+    analyze.dataset.analyzeItemId = item.id;
+    analyze.append(icon("sparkles"), document.createTextNode("分析此条"));
+    actions.append(analyze);
+  }
   const blockFeed = document.createElement("button");
   blockFeed.type = "button";
   blockFeed.className = "text-action";
   blockFeed.dataset.action = "block-feed";
-  blockFeed.dataset.itemID = item.id;
+  blockFeed.dataset.itemId = item.id;
   blockFeed.textContent = item.feedback.includes("block-feed") ? "已屏蔽来源" : "屏蔽来源";
   actions.append(blockFeed);
   article.append(actions);
@@ -333,7 +444,7 @@ function renderDetail() {
   const body = section("原文");
   const bodyText = document.createElement("div");
   bodyText.className = "article-body";
-  const paragraphs = firstText(item.content, item.source_summary, "订阅源没有提供可显示的正文。").split(/\n{2,}/);
+  const paragraphs = readableParagraphs(item.content, item.source_summary);
   for (const paragraph of paragraphs) {
     const content = paragraph.trim();
     if (!content) {
@@ -396,7 +507,7 @@ function feedbackIconButton(item, action, iconName, label) {
   button.type = "button";
   button.className = "feedback-button";
   button.dataset.action = action;
-  button.dataset.itemID = item.id;
+  button.dataset.itemId = item.id;
   button.setAttribute("aria-label", label);
   button.dataset.tooltip = label;
   button.classList.toggle("is-active", item.feedback.includes(action));
@@ -423,6 +534,9 @@ function filteredItems() {
     if (state.sourceFilter && item.feed_url !== state.sourceFilter) {
       return false;
     }
+	if (state.topic && !matchesTopic(item, state.topic)) {
+	  return false;
+	}
     if (!search) {
       return true;
     }
@@ -434,8 +548,53 @@ function filteredItems() {
   });
 }
 
+function matchesTopic(item, topic) {
+	const text = [item.title, item.analysis_title, item.summary, item.why, ...item.tags].filter(Boolean).join(" ").toLowerCase();
+	const terms = {
+	  paradigm: ["loop engineering", "harness engineering", "context engineering", "agent evaluation", "范式"],
+	  codex: ["codex", "openai/codex"],
+	  skills: ["skill", "skills", "mcp", "model context protocol"],
+	  model: ["model", "模型", "inference", "推理", "context", "上下文", "eval"],
+	  frontend: ["frontend", "前端", "ui", "ux", "design system", "react", "next.js"],
+	};
+	return (terms[topic] || []).some((term) => text.includes(term));
+}
+
 function selectedItem() {
   return state.items.find((item) => item.id === state.selectedID);
+}
+
+function normalizeItem(item) {
+  return {
+    ...item,
+    feedback: Array.isArray(item.feedback) ? item.feedback : [],
+    key_points: Array.isArray(item.key_points) ? item.key_points : [],
+    tags: Array.isArray(item.tags) ? item.tags : [],
+  };
+}
+
+function readableParagraphs(content, fallback) {
+  const source = firstText(content, fallback, "订阅源没有提供可显示的正文。");
+  if (!/<[a-z][\s\S]*>/i.test(source)) {
+    return source.split(/\n{2,}/);
+  }
+  const documentNode = new DOMParser().parseFromString(source, "text/html");
+  documentNode.querySelectorAll("script, style, noscript, template, iframe, svg").forEach((node) => node.remove());
+  const blocks = [];
+  for (const node of documentNode.body.querySelectorAll("h1, h2, h3, h4, p, li, blockquote, pre")) {
+    const text = normalizeReadableText(node.textContent);
+    if (text && blocks[blocks.length - 1] !== text) {
+      blocks.push(text);
+    }
+  }
+  if (blocks.length) {
+    return blocks;
+  }
+  return [normalizeReadableText(documentNode.body.textContent) || fallback];
+}
+
+function normalizeReadableText(value) {
+  return String(value || "").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function displayTitle(item) {
@@ -577,10 +736,11 @@ async function runNow() {
   }
   elements.runButton.disabled = true;
   elements.runStatus.textContent = "正在运行";
+	state.pollingActive = true;
   try {
     const query = new URLSearchParams({ profile: state.profile });
     const result = await request(`/api/run?${query}`, { method: "POST" });
-    showToast(`完成：抓取 ${result.fetched}，分析 ${result.analyzed}，推送 ${result.pushed}`);
+    showToast(`完成：抓取 ${result.fetched}，缓存 ${result.cached}，首轮分析 ${result.analyzed}，后台排队 ${result.queued}`);
     await loadWorkspace(state.profile, state.selectedID);
   } catch (error) {
     showToast(error.message, true);
@@ -588,6 +748,56 @@ async function runNow() {
   } finally {
     elements.runButton.disabled = false;
   }
+}
+
+async function analyzeItem(itemID) {
+  const item = state.items.find((entry) => entry.id === itemID);
+  if (!item || !window.confirm(`分析“${displayTitle(item)}”？这会调用已配置的模型，但不会自动推送。`)) {
+    return;
+  }
+  elements.runStatus.textContent = "正在分析";
+  try {
+    const query = new URLSearchParams({ profile: state.profile, item_id: itemID });
+    const result = await request(`/api/analyze?${query}`, { method: "POST" });
+    showToast(result.cached ? "已使用现有分析结果" : "分析完成");
+    await loadWorkspace(state.profile, itemID);
+  } catch (error) {
+    showToast(error.message, true);
+    elements.runStatus.textContent = "分析失败";
+  }
+}
+
+function openIngestDialog() {
+	elements.ingestForm.reset();
+	elements.ingestDialog.showModal();
+	elements.ingestForm.elements.url.focus();
+}
+
+async function submitIngest(event) {
+	event.preventDefault();
+	const form = new FormData(elements.ingestForm);
+	const submit = elements.ingestForm.querySelector('[type="submit"]');
+	submit.disabled = true;
+	try {
+		const result = await request("/api/ingest", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				profile: state.profile,
+				url: String(form.get("url") || "").trim(),
+				title: String(form.get("title") || "").trim(),
+				content: String(form.get("content") || "").trim(),
+				tags: String(form.get("tags") || "").split(",").map((tag) => tag.trim()).filter(Boolean),
+			}),
+		});
+		elements.ingestDialog.close();
+		showToast("已加入情报库，可以继续分析此条");
+		await loadWorkspace(state.profile, result.item_id);
+	} catch (error) {
+		showToast(error.message, true);
+	} finally {
+		submit.disabled = false;
+	}
 }
 
 const commands = [
@@ -681,6 +891,11 @@ elements.profileSelect.addEventListener("change", () => {
   loadWorkspace(elements.profileSelect.value, "");
 });
 
+elements.editionSelect.addEventListener("change", () => {
+	state.edition = elements.editionSelect.value;
+	loadWorkspace(state.profile, "");
+});
+
 elements.digestSearch.addEventListener("input", () => {
   state.search = elements.digestSearch.value;
   renderNavigation();
@@ -688,6 +903,13 @@ elements.digestSearch.addEventListener("input", () => {
 });
 
 document.addEventListener("click", (event) => {
+  const analyze = event.target.closest("[data-analyze-item-id]");
+  if (analyze) {
+    event.preventDefault();
+    event.stopPropagation();
+    analyzeItem(analyze.dataset.analyzeItemId);
+    return;
+  }
   const feedback = event.target.closest("[data-action][data-item-id]");
   if (feedback) {
     event.preventDefault();
@@ -716,8 +938,7 @@ document.addEventListener("click", (event) => {
     state.collectionFilter = "all";
     state.view = tab.dataset.view;
     state.sourceFilter = "";
-    renderNavigation();
-    renderDigest();
+    loadWorkspace(state.profile, "");
     return;
   }
   const source = event.target.closest(".source-item[data-source]");
@@ -744,7 +965,23 @@ document.addEventListener("click", (event) => {
   }
 });
 
+elements.digestList.addEventListener("scroll", () => {
+  if (elements.digestList.scrollTop + elements.digestList.clientHeight >= elements.digestList.scrollHeight - 120) loadMoreItems();
+});
+
+window.setInterval(refreshAnalysis, 3000);
+
 elements.runButton.addEventListener("click", runNow);
+elements.ingestTrigger.addEventListener("click", openIngestDialog);
+elements.ingestForm.addEventListener("submit", submitIngest);
+for (const close of document.querySelectorAll("[data-close-ingest]")) {
+	close.addEventListener("click", () => elements.ingestDialog.close());
+}
+elements.topicSelect.addEventListener("change", () => {
+	state.topic = elements.topicSelect.value;
+	renderNavigation();
+	renderDigest();
+});
 elements.commandTrigger.addEventListener("click", openCommandPalette);
 elements.commandSearch.addEventListener("input", renderCommands);
 elements.navToggle.addEventListener("click", () => elements.navPane.classList.toggle("is-open"));

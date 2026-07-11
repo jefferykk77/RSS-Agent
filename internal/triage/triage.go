@@ -138,6 +138,18 @@ func score(item rss.Item, terms []string) (int, []string) {
 			reasons = append(reasons, "priority term: "+term+" (content)")
 		}
 	}
+	all := strings.Join([]string{title, metadata, body}, " ")
+	switch {
+	case containsAny(all, []string{"loop engineering", "harness engineering", "context engineering", "agent evaluation", "applied ai engineering", "retrospective", "postmortem", "复盘", "工程实践"}):
+		score += 12
+		reasons = append(reasons, "highest priority: engineering practice")
+	case containsAny(all, []string{"skills", "skill", "mcp", "model context protocol"}):
+		score += 8
+		reasons = append(reasons, "second priority: skills/mcp")
+	case containsAny(all, []string{"codex"}):
+		score += 4
+		reasons = append(reasons, "third priority: codex usage")
+	}
 	if len(reasons) == 0 {
 		reasons = append(reasons, "recent item")
 	}
