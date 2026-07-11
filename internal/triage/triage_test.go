@@ -83,3 +83,16 @@ func TestFilterWithFeedbackBlocksItemsAndFeeds(t *testing.T) {
 		t.Fatalf("items = %+v, want only candidate", result.Items)
 	}
 }
+
+func TestEngineeringPracticeRanksBeforeSkillsAndCodex(t *testing.T) {
+	now := time.Now()
+	items := []rss.Item{
+		{ID: "codex", Title: "Codex usage update", PublishedAt: now},
+		{ID: "skills", Title: "A useful MCP skill", PublishedAt: now.Add(-time.Minute)},
+		{ID: "practice", Title: "Loop engineering retrospective", PublishedAt: now.Add(-2 * time.Minute)},
+	}
+	result := Filter(items, nil, config.Profile{}, config.Settings{LookbackHours: 24}, false, now)
+	if len(result.Items) != 3 || result.Items[0].ID != "practice" || result.Items[1].ID != "skills" || result.Items[2].ID != "codex" {
+		t.Fatalf("order=%+v", result.Items)
+	}
+}

@@ -15,6 +15,20 @@ func TestCandidateLimitDefaultsAndAllowsZero(t *testing.T) {
 	}
 }
 
+func TestProfileHashIncludesModelAndPromptVersion(t *testing.T) {
+	cfg := Sample()
+	base := cfg.ProfileHash()
+	cfg.Models.Primary.Name = "different-endpoint"
+	if cfg.ProfileHash() == base {
+		t.Fatal("ProfileHash must change when the model endpoint changes")
+	}
+	modelHash := cfg.ProfileHash()
+	cfg.Settings.AnalysisPromptVersion = "next-prompt"
+	if cfg.ProfileHash() == modelHash {
+		t.Fatal("ProfileHash must change when the prompt version changes")
+	}
+}
+
 func TestFullTextDefaultsAndValidation(t *testing.T) {
 	cfg := Sample()
 	if cfg.Settings.FullTextMinChars != 600 {
@@ -108,5 +122,25 @@ func TestSampleRoundTripsThroughYAML(t *testing.T) {
 	}
 	if _, err := Load(path); err != nil {
 		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestXSearchDefaultsAndTokenResolution(t *testing.T) {
+	cfg := Sample()
+	cfg.X.Searches = []XSearch{{Name: "X AI", Query: "AI lang:en -is:retweet"}}
+	cfg.ApplyDefaults()
+	if cfg.X.BaseURL != "https://api.x.com/2" || cfg.X.Searches[0].MaxResults != 20 {
+		t.Fatalf("X defaults = %+v", cfg.X)
+	}
+	t.Setenv("X_BEARER_TOKEN", "x-token")
+	if got := cfg.XBearerToken(); got != "x-token" {
+		t.Fatalf("XBearerToken() = %q", got)
+	}
+	if searches := cfg.EnabledXSearches(); len(searches) != 1 || searches[0].Name != "X AI" {
+		t.Fatalf("EnabledXSearches() = %+v", searches)
+	}
+	cfg.X.Searches[0].MaxResults = 9
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil for invalid X search max_results")
 	}
 }

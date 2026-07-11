@@ -3,10 +3,15 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -15,6 +20,54 @@ import (
 	"github.com/jeffery/rss-agent/internal/config"
 	"github.com/jeffery/rss-agent/internal/rss"
 )
+
+type minuteLimiter struct {
+	mu               sync.Mutex
+	rpm, tpm         int
+	window           time.Time
+	requests, tokens int
+}
+
+var globalLimiter = &minuteLimiter{rpm: 400, tpm: 800000}
+
+func ConfigureRateLimit(rpm, tpm int) {
+	globalLimiter.mu.Lock()
+	defer globalLimiter.mu.Unlock()
+	if rpm > 0 {
+		globalLimiter.rpm = rpm
+	}
+	if tpm > 0 {
+		globalLimiter.tpm = tpm
+	}
+}
+
+func (l *minuteLimiter) wait(ctx context.Context, tokens int) error {
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		if l.window.IsZero() || now.Sub(l.window) >= time.Minute {
+			l.window, l.requests, l.tokens = now, 0, 0
+		}
+		if l.requests < l.rpm && l.tokens+tokens <= l.tpm {
+			l.requests++
+			l.tokens += tokens
+			l.mu.Unlock()
+			return nil
+		}
+		wait := time.Until(l.window.Add(time.Minute))
+		l.mu.Unlock()
+		if wait < time.Second {
+			wait = time.Second
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
 
 type ChatGenerator interface {
 	Generate(ctx context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error)
@@ -134,31 +187,45 @@ func (a *Agent) AnalyzeWithUsage(ctx context.Context, profile config.Profile, it
 	}
 	var results []Result
 	var usages []Usage
+	var analysisErrors []error
 	itemByID := make(map[string]rss.Item, len(items))
 	for _, item := range items {
 		itemByID[item.StableID()] = item
 	}
-
-	for start := 0; start < len(items); start += batchSize {
-		end := min(start+batchSize, len(items))
-		decisions, usage, err := a.analyzeBatch(ctx, profile, items[start:end])
-		if err != nil {
-			return nil, usages, err
-		}
-		usages = append(usages, usage)
+	appendDecisions := func(decisions []Decision, usage Usage) {
 		for _, decision := range decisions {
 			item, ok := itemByID[decision.ItemID]
 			if !ok {
 				continue
 			}
 			decision.Score = clamp(decision.Score, 0, 10)
-			results = append(results, Result{
-				Item:       item,
-				Decision:   decision,
-				ModelLabel: usage.ModelLabel,
-				ModelName:  usage.Model,
-			})
+			results = append(results, Result{Item: item, Decision: decision, ModelLabel: usage.ModelLabel, ModelName: usage.Model})
 		}
+	}
+
+	for start := 0; start < len(items); start += batchSize {
+		end := min(start+batchSize, len(items))
+		decisions, usage, err := a.analyzeBatch(ctx, profile, items[start:end])
+		if err != nil {
+			if end-start == 1 {
+				analysisErrors = append(analysisErrors, fmt.Errorf("item %s: %w", items[start].StableID(), err))
+				continue
+			}
+			// A truncated or malformed batch must not fail the whole run. Retry each item
+			// independently, which also gives smaller models enough output budget.
+			for _, item := range items[start:end] {
+				single, singleUsage, singleErr := a.analyzeBatch(ctx, profile, []rss.Item{item})
+				if singleErr != nil {
+					analysisErrors = append(analysisErrors, fmt.Errorf("item %s: %w", item.StableID(), singleErr))
+					continue
+				}
+				usages = append(usages, singleUsage)
+				appendDecisions(single, singleUsage)
+			}
+			continue
+		}
+		usages = append(usages, usage)
+		appendDecisions(decisions, usage)
 	}
 
 	sort.SliceStable(results, func(i, j int) bool {
@@ -167,13 +234,13 @@ func (a *Agent) AnalyzeWithUsage(ctx context.Context, profile config.Profile, it
 		}
 		return results[i].Decision.Score > results[j].Decision.Score
 	})
-	return results, usages, nil
+	return results, usages, errors.Join(analysisErrors...)
 }
 
 func (a *Agent) analyzeBatch(ctx context.Context, profile config.Profile, items []rss.Item) ([]Decision, Usage, error) {
 	payload := buildUserPayload(profile, items)
 	messages := []*schema.Message{
-		schema.SystemMessage(systemPrompt(profile.Language)),
+		schema.SystemMessage(intelligencePrompt(profile.Language)),
 		schema.UserMessage(payload),
 	}
 	var lastErr error
@@ -197,6 +264,33 @@ func (a *Agent) analyzeBatch(ctx context.Context, profile config.Profile, items 
 	return nil, Usage{}, lastErr
 }
 
+func intelligencePrompt(language string) string {
+	if language == "" {
+		language = "zh-CN"
+	}
+	return fmt.Sprintf(`You curate an AI frontier intelligence digest. Return strict JSON only, using the requested language %s.
+
+Selection policy:
+- Ranking priority is strict: (1) first-person engineering practice, implementation retrospectives, new engineering paradigms and reproducible tutorials; (2) recently high-star, fast-growing or genuinely discussed Skills/MCP that Codex can use; (3) Codex product usage and workflow updates.
+- Prefer primary sources and tools that can be tried now. Evidence and concrete implementation details matter more than brand or announcement recency.
+- For coding agents, Codex is the only product tracked as a primary topic. Other coding agents may appear only when the method is directly transferable to Codex; explain that transfer.
+- Strong positive examples include loop engineering, harness engineering, context engineering, agent evaluation, applied AI engineering, Codex workflows, useful Skills, and MCP servers.
+- Frontend content is an ordinary subtopic with no reserved quota. Include it only when users can see a real demo/screenshot/result and Codex can consume the associated skill, MCP, code, or structured guide.
+- Penalize funding-only news, marketing, title bait, reposts, unsupported opinions, and shallow summaries.
+- A high score requires novelty, technical substance, practical evidence, reproducibility, clarity, and source credibility.
+
+Output requirements:
+- summary: 2-3 clear sentences explaining the conclusion in accessible Chinese.
+- why: why it matters now and what it is useful for, especially for Codex when relevant.
+- key_points: concrete takeaways and an immediate next action. For Skills/MCP include only applicable tech stack and expected effect as dedicated points.
+- tags: stable topic tags such as paradigm, codex, skills, mcp, model-infra, applied-ai, frontend.
+- should_push must be false when quality is uncertain. Never fill a quota with weak content.
+- Return exactly one object for every input item and no extra fields.
+
+JSON schema:
+[{"item_id":"exact input item_id","score":0,"should_push":false,"title":"readable title","summary":"summary","why":"reason","key_points":["point"],"tags":["topic"]}]`, language)
+}
+
 func generateValidated(ctx context.Context, entry modelEntry, messages []*schema.Message, items []rss.Item) ([]Decision, int, int, error) {
 	var (
 		lastErr      error
@@ -211,8 +305,17 @@ func generateValidated(ctx context.Context, entry modelEntry, messages []*schema
 			))
 		}
 		inputTokens += estimateMessageTokens(attemptMessages)
+		if err := globalLimiter.wait(ctx, estimateMessageTokens(attemptMessages)+entry.config.MaxTokens); err != nil {
+			return nil, inputTokens, outputTokens, err
+		}
 
-		resp, err := entry.model.Generate(ctx, attemptMessages)
+		callCtx := ctx
+		cancel := func() {}
+		if entry.config.Timeout > 0 {
+			callCtx, cancel = context.WithTimeout(ctx, entry.config.Timeout)
+		}
+		resp, err := entry.model.Generate(callCtx, attemptMessages)
+		cancel()
 		if err != nil {
 			lastErr = fmt.Errorf("模型 %s 第 %d 次调用失败：%w", entry.config.Label, attempt+1, err)
 			continue
@@ -381,16 +484,19 @@ func validateDecisionSchema(raw json.RawMessage) (Decision, error) {
 	if strings.TrimSpace(string(fields["should_push"])) != "true" && strings.TrimSpace(string(fields["should_push"])) != "false" {
 		return Decision{}, fmt.Errorf("字段 \"should_push\" 必须是布尔值")
 	}
-	if strings.TrimSpace(string(fields["score"])) == "null" {
-		return Decision{}, fmt.Errorf("字段 \"score\" 必须是整数")
-	}
-
-	var decision Decision
-	if err := json.Unmarshal(raw, &decision); err != nil {
+	normalizedScore, normalized, err := normalizeScore(fields["score"])
+	if err != nil {
 		return Decision{}, err
 	}
-	if decision.Score < 0 || decision.Score > 10 {
-		return Decision{}, fmt.Errorf("字段 \"score\" 必须在 0-10 之间")
+	fields["score"] = json.RawMessage(strconv.Itoa(normalizedScore))
+	normalizedRaw, _ := json.Marshal(fields)
+
+	var decision Decision
+	if err := json.Unmarshal(normalizedRaw, &decision); err != nil {
+		return Decision{}, err
+	}
+	if normalized {
+		log.Printf("analysis_warning kind=score_normalized item_id=%q score=%d", decision.ItemID, decision.Score)
 	}
 	for name, value := range map[string]string{
 		"item_id": decision.ItemID,
@@ -409,6 +515,28 @@ func validateDecisionSchema(raw json.RawMessage) (Decision, error) {
 		return Decision{}, err
 	}
 	return decision, nil
+}
+
+func normalizeScore(raw json.RawMessage) (int, bool, error) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return 0, false, fmt.Errorf("字段 \"score\" 必须是数字")
+	}
+	if strings.HasPrefix(text, "\"") {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return 0, false, fmt.Errorf("字段 \"score\" 必须是数字")
+		}
+		text = strings.TrimSpace(value)
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false, fmt.Errorf("字段 \"score\" 必须是数字")
+	}
+	rounded := int(math.Round(value))
+	clamped := clamp(rounded, 0, 10)
+	normalized := text != strconv.Itoa(clamped) || rounded != clamped
+	return clamped, normalized, nil
 }
 
 func validateStringList(name string, raw json.RawMessage, values []string) error {

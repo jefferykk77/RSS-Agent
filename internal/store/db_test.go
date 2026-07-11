@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -102,6 +103,87 @@ func TestDBRoundTrip(t *testing.T) {
 	}
 	if tokens != 120 {
 		t.Fatalf("tokens = %d, want 120", tokens)
+	}
+}
+
+func TestAnalysisQueueDeduplicatesPromotesAndCompletes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	item := rss.Item{FeedName: "Feed", FeedURL: "feed", Title: "Queued", Link: "https://example.com/q", Content: "body"}
+	if err := db.UpsertItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertProfileItem(ctx, "default", item); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueAnalysis(ctx, 1, "default", "profile", "v1", item, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueAnalysis(ctx, 1, "default", "profile", "v1", item, 80); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ClaimAnalysisTasks(ctx, "default", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Priority != 80 {
+		t.Fatalf("tasks=%+v", tasks)
+	}
+	if err := db.CompleteAnalysisTasks(ctx, []int64{tasks[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := db.AnalysisQueueStats(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Completed != 1 || stats.Pending != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestRecoveryRunIncludesExistingCompletedAndPendingTasks(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < 2; i++ {
+		item := rss.Item{ID: fmt.Sprintf("item-%d", i), FeedName: "Feed", FeedURL: "feed", Title: "Item", Content: fmt.Sprint(i)}
+		if err := db.UpsertItem(ctx, item); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpsertProfileItem(ctx, "default", item); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.EnqueueAnalysis(ctx, 0, "default", "profile", "v1", item, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks, err := db.ClaimAnalysisTasks(ctx, "default", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompleteAnalysisTasks(ctx, []int64{tasks[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	runID, err := db.EnsureRecoveryRun(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runID == 0 {
+		t.Fatal("missing recovery run")
+	}
+	run, ok, err := db.CurrentAnalysisRun(ctx, "default")
+	if err != nil || !ok {
+		t.Fatalf("run=%+v ok=%v err=%v", run, ok, err)
+	}
+	if run.Total != 2 || run.Analyzed != 1 || run.Pending != 1 {
+		t.Fatalf("run=%+v", run)
 	}
 }
 
@@ -268,5 +350,45 @@ func TestProfileScopedItemsSeenAndFeedback(t *testing.T) {
 	}
 	if len(digest[0].Feedback) != 1 || digest[0].Feedback[0] != FeedbackBlockFeed {
 		t.Fatalf("digest feedback = %+v", digest[0].Feedback)
+	}
+}
+
+func TestItemForProfileRestoresStoredRSSItem(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "rss-agent.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	item := rss.Item{
+		FeedName:   "Example",
+		FeedURL:    "https://example.com/feed.xml",
+		FeedTags:   []string{"ai"},
+		Title:      "Stored item",
+		Link:       "https://example.com/post",
+		GUID:       "example-guid",
+		Author:     "Author",
+		Categories: []string{"agents"},
+		Summary:    "Summary",
+		Content:    "Full text",
+	}
+	item.ID = item.StableID()
+	if err := db.UpsertItem(ctx, item); err != nil {
+		t.Fatalf("UpsertItem() error = %v", err)
+	}
+	if err := db.UpsertProfileItem(ctx, "default", item); err != nil {
+		t.Fatalf("UpsertProfileItem() error = %v", err)
+	}
+
+	got, err := db.ItemForProfile(ctx, "default", item.ID)
+	if err != nil {
+		t.Fatalf("ItemForProfile() error = %v", err)
+	}
+	if got.ID != item.ID || got.Content != item.Content || got.Author != item.Author {
+		t.Fatalf("item = %+v", got)
+	}
+	if len(got.FeedTags) != 1 || got.FeedTags[0] != "ai" || len(got.Categories) != 1 || got.Categories[0] != "agents" {
+		t.Fatalf("stored tags = %+v categories = %+v", got.FeedTags, got.Categories)
 	}
 }

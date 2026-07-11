@@ -50,13 +50,16 @@ go run ./cmd/rss-agent once
 常规 `once` 和 `watch` 运行会在 `database.path` 指定的 SQLite 文件中保存：
 
 - RSS 源的 `ETag`、`Last-Modified` 和抓取状态。后续请求会使用条件请求，`304 Not Modified` 时不会重复解析内容。
-- RSS 条目、内容去重信息、已读状态和推送记录。
+- RSS 条目、内容去重信息、已读状态和历史推送记录。
 - LLM 评分、摘要、理由和标签。相同文章在相同偏好配置下会命中 `analysis_cache_ttl` 分析缓存，避免重复调用模型。
+- 持久化评分任务及其优先级、重试时间和错误状态。应用重启后会恢复未完成任务。
 - 模型 token 用量和按模型价格换算的成本记录。
 
 若 RSS 提供的摘要和正文少于 `full_text_min_chars`（默认 600），Agent 会仅为通过本地筛选的候选文章抓取链接页的 HTML 正文。提取并清洗后的正文最多保留 `full_text_max_chars`（默认 8000）个字符，页面响应体限制为 2 MiB，抓取失败只会记录为警告。
 
-模型调用前会先去重、跳过已读、过期、静默和排除内容，再按优先词排序并受候选上限控制：
+“立即运行”会拉取每个来源最多 20 条，并同步完成每个来源最新 10 条的评分。其余内容进入后台队列，滚动加载时会自动提权。模型调用共享 `400 RPM / 800,000 TPM` 的保守限流器：
+
+每次运行都有独立进度记录。Web 会原地更新当前可见文章，并区分待分析、正在重试、等待模型额度和失败；模型返回的数字字符串、小数或越界 `score` 会自动规范化到 `0–10`，不会因这一字段反复消耗额度。
 
 ```yaml
 profile:
@@ -64,7 +67,11 @@ profile:
   muted_feeds: ["低价值来源名称"]
   muted_tags: [招聘, 营销]
 settings:
-  max_candidates_per_run: 24 # 设为 0 表示不限制
+  max_candidates_per_run: 0
+  initial_items_per_feed: 10
+  analysis_rpm: 400
+  analysis_tpm: 800000
+  initial_token_budget: 700000
   analysis_cache_ttl: 168h
   full_text_min_chars: 600
   full_text_max_chars: 8000
@@ -230,9 +237,24 @@ push:
 
 Web 工作台直接读取与 CLI 相同的 SQLite 数据库，提供订阅画像切换、Digest 筛选与搜索、文章详情、反馈记录和命令面板。默认仅监听本机回环地址：
 
+工作台还提供主题筛选、来源健康状态和“投喂”入口。投喂链接会尝试读取页面标题与正文；X 等无法直接读取的页面可以同时填写标题或粘贴正文。`希望看同类`、`太浅`、`太理论`、`太营销`、`无法使用`会作为显式偏好信号保存在 SQLite。
+
 ```powershell
 go run ./cmd/rss-agent serve
 # 打开 http://127.0.0.1:8787
+```
+
+## AI 情报调度
+
+`watch` 每小时增量抓取和分析，Digest 时间仍用于形成早报/晚报历史。当前版本不连接任何第三方推送渠道：
+
+```yaml
+settings:
+  interval: 1h
+digest:
+  times: ["08:00", "20:00"]
+  daily_limit: 12
+  per_run_limit: 6
 ```
 
 指定其他端口：
@@ -241,7 +263,7 @@ go run ./cmd/rss-agent serve
 go run ./cmd/rss-agent serve -addr 127.0.0.1:8790
 ```
 
-页面上的“立即运行”会调用与 `rss-agent once` 相同的真实抓取、分析和推送流程，可能产生模型费用；仅在确认配置和预算后使用。
+页面上的“立即运行”会调用与 `rss-agent once` 相同的真实抓取和分析流程，可能产生模型费用；抓取成功的文章即使尚未评分也会保存在 SQLite。
 
 ## 命令速查
 

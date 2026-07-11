@@ -3,30 +3,39 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/compose"
 	"github.com/jeffery/rss-agent/internal/agent"
 	"github.com/jeffery/rss-agent/internal/config"
-	"github.com/jeffery/rss-agent/internal/push"
+	"github.com/jeffery/rss-agent/internal/discovery"
 	"github.com/jeffery/rss-agent/internal/rss"
 	"github.com/jeffery/rss-agent/internal/store"
 	"github.com/jeffery/rss-agent/internal/triage"
+	xsource "github.com/jeffery/rss-agent/internal/x"
 )
 
 type RunOptions struct {
 	DryRun      bool
 	IncludeSeen bool
 	ProfileID   string
+	CollectOnly bool
 }
 
 type RunSummary struct {
+	RunID       int64
 	Fetched     int
 	NotModified int
 	Candidate   int
 	Cached      int
 	Analyzed    int
+	Queued      int
+	RateLimited int
 	Pushed      int
 	LLMCostCNY  float64
 	Triage      triage.Stats
@@ -34,6 +43,7 @@ type RunSummary struct {
 }
 
 type runState struct {
+	runID      int64
 	cfg        *config.Config
 	options    RunOptions
 	db         *store.DB
@@ -41,6 +51,7 @@ type runState struct {
 	summary    RunSummary
 	fetched    []rss.Item
 	candidates []rss.Item
+	initial    []rss.Item
 	decisions  []agent.Result
 }
 
@@ -57,6 +68,13 @@ func RunOnce(ctx context.Context, cfg *config.Config, options RunOptions) (RunSu
 		db:      db,
 		fetcher: rss.NewFetcher(cfg.HTTPTimeout()),
 	}
+	if !options.DryRun {
+		state.runID, err = db.CreateAnalysisRun(ctx, options.ProfileID, "initial")
+		if err != nil {
+			return RunSummary{}, err
+		}
+		state.summary.RunID = state.runID
+	}
 	flow, err := newRunGraph(ctx)
 	if err != nil {
 		return state.summary, err
@@ -66,6 +84,168 @@ func RunOnce(ctx context.Context, cfg *config.Config, options RunOptions) (RunSu
 		output = state
 	}
 	return output.summary, err
+}
+
+// AnalyzeSavedItem analyzes one existing digest item without pushing it to delivery channels.
+func AnalyzeSavedItem(ctx context.Context, cfg *config.Config, profileID string, itemID string) (RunSummary, error) {
+	db, err := store.Open(cfg.DatabasePath())
+	if err != nil {
+		return RunSummary{}, err
+	}
+	defer db.Close()
+
+	item, err := db.ItemForProfile(ctx, profileID, itemID)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	feedback, err := db.FeedbackFiltersForProfile(ctx, profileID)
+	if err != nil {
+		return RunSummary{}, err
+	}
+	if feedback.BlockedItemIDs[item.StableID()] || feedback.BlockedFeedURLs[item.FeedURL] {
+		return RunSummary{}, fmt.Errorf("item %q is blocked by feedback", itemID)
+	}
+
+	summary := RunSummary{Candidate: 1}
+	cached, uncached, err := splitCached(ctx, db, []rss.Item{item}, cfg.ProfileHash(), cfg.AnalysisCacheTTL())
+	if err != nil {
+		return summary, err
+	}
+	summary.Cached = len(cached)
+	if len(uncached) == 0 {
+		return summary, nil
+	}
+	if err := checkBudget(ctx, db, cfg); err != nil {
+		return summary, err
+	}
+	modelCfgs, err := cfg.ResolvedModels()
+	if err != nil {
+		return summary, err
+	}
+	rssAgent, err := agent.NewPool(ctx, modelCfgs)
+	if err != nil {
+		return summary, err
+	}
+	fresh, usages, err := rssAgent.AnalyzeWithUsage(ctx, cfg.Profile, uncached, cfg.Settings.BatchSize)
+	if err != nil {
+		return summary, err
+	}
+	summary.Analyzed = len(fresh)
+	for _, result := range fresh {
+		if err := db.SaveAnalysis(ctx, result.Item, cfg.ProfileHash(), result.ModelLabel, result.ModelName, result.Decision); err != nil {
+			return summary, err
+		}
+	}
+	cost, err := recordUsageCosts(ctx, db, modelCfgs, usages)
+	if err != nil {
+		return summary, err
+	}
+	summary.LLMCostCNY = cost
+	return summary, nil
+}
+
+// DrainAnalysisQueue processes persisted background work until no ready tasks remain.
+func DrainAnalysisQueue(ctx context.Context, cfg *config.Config, profileID string) error {
+	db, err := store.Open(cfg.DatabasePath())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.RecoverAnalysisTasks(ctx, time.Now().Add(-10*time.Minute)); err != nil {
+		return err
+	}
+	modelCfgs, err := cfg.ResolvedModels()
+	if err != nil {
+		return err
+	}
+	rssAgent, err := agent.NewPool(ctx, modelCfgs)
+	if err != nil {
+		return err
+	}
+	agent.ConfigureRateLimit(cfg.Settings.AnalysisRPM, cfg.Settings.AnalysisTPM)
+	for {
+		tasks, err := db.ClaimAnalysisTasks(ctx, profileID, cfg.Settings.BatchSize)
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 0 {
+			stats, statsErr := db.AnalysisQueueStats(ctx, profileID)
+			if statsErr != nil {
+				return statsErr
+			}
+			if stats.Pending+stats.Running+stats.Retrying+stats.RateLimited == 0 {
+				return nil
+			}
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		items := make([]rss.Item, 0, len(tasks))
+		for _, task := range tasks {
+			item, itemErr := db.ItemForProfile(ctx, profileID, task.ItemID)
+			if itemErr != nil {
+				_ = db.FailAnalysisTasks(ctx, []int64{task.ID}, itemErr.Error())
+				continue
+			}
+			items = append(items, item)
+		}
+		if len(items) == 0 {
+			continue
+		}
+		results, usages, analyzeErr := rssAgent.AnalyzeWithUsage(ctx, cfg.Profile, items, cfg.Settings.BatchSize)
+		taskByItem := map[string]store.AnalysisTask{}
+		for _, task := range tasks {
+			taskByItem[task.ItemID] = task
+		}
+		var completedIDs []int64
+		for _, result := range results {
+			if err := db.SaveAnalysis(ctx, result.Item, cfg.ProfileHash(), result.ModelLabel, result.ModelName, result.Decision); err != nil {
+				return err
+			}
+			if task, ok := taskByItem[result.Item.StableID()]; ok {
+				completedIDs = append(completedIDs, task.ID)
+				delete(taskByItem, result.Item.StableID())
+			}
+		}
+		if _, err := recordUsageCosts(ctx, db, modelCfgs, usages); err != nil {
+			return err
+		}
+		if err := db.CompleteAnalysisTasks(ctx, completedIDs); err != nil {
+			return err
+		}
+		var remaining []int64
+		maxAttempts := 0
+		for _, task := range taskByItem {
+			remaining = append(remaining, task.ID)
+			if task.Attempts > maxAttempts {
+				maxAttempts = task.Attempts
+			}
+		}
+		if len(remaining) > 0 {
+			message := "模型未返回该条目的有效结果"
+			if analyzeErr != nil {
+				message = analyzeErr.Error()
+			}
+			if isRateLimitError(analyzeErr) {
+				if err := db.RetryAnalysisTasks(ctx, remaining, message, time.Now().Add(rateLimitDelay(analyzeErr)), false); err != nil {
+					return err
+				}
+			} else if maxAttempts >= 2 {
+				if err := db.FailAnalysisTasks(ctx, remaining, message); err != nil {
+					return err
+				}
+			} else {
+				if err := db.RetryAnalysisTasks(ctx, remaining, message, time.Now().Add(time.Duration(maxAttempts+1)*15*time.Second), true); err != nil {
+					return err
+				}
+			}
+		}
+	}
 }
 
 func newRunGraph(ctx context.Context) (compose.Runnable[*runState, *runState], error) {
@@ -78,7 +258,6 @@ func newRunGraph(ctx context.Context) (compose.Runnable[*runState, *runState], e
 		{key: "filter", run: filterRunNode},
 		{key: "enrich", run: enrichRunNode},
 		{key: "analyze", run: analyzeRunNode},
-		{key: "push", run: pushRunNode},
 	}
 	for _, node := range nodes {
 		if err := graph.AddLambdaNode(node.key, compose.InvokableLambda[*runState, *runState](node.run)); err != nil {
@@ -90,8 +269,7 @@ func newRunGraph(ctx context.Context) (compose.Runnable[*runState, *runState], e
 		{"fetch", "filter"},
 		{"filter", "enrich"},
 		{"enrich", "analyze"},
-		{"analyze", "push"},
-		{"push", compose.END},
+		{"analyze", compose.END},
 	}
 	for _, edge := range edges {
 		if err := graph.AddEdge(edge[0], edge[1]); err != nil {
@@ -107,11 +285,24 @@ func fetchRunNode(ctx context.Context, state *runState) (*runState, error) {
 		feedStore = state.db
 	}
 	fetched := state.fetcher.Fetch(ctx, state.cfg.EnabledFeeds(), state.cfg.Settings.MaxItemsPerFeed, feedStore)
-	state.fetched = fetched.Items
+	state.fetched = append([]rss.Item(nil), fetched.Items...)
 	state.summary = RunSummary{
+		RunID:       state.runID,
 		Fetched:     len(fetched.Items),
 		NotModified: fetched.NotModified,
 		Errors:      fetched.Errs,
+	}
+	if searches := state.cfg.EnabledXSearches(); len(searches) > 0 {
+		xFetched := xsource.New(state.cfg.X.BaseURL, state.cfg.XBearerToken(), &http.Client{Timeout: state.cfg.HTTPTimeout()}).FetchSearches(ctx, searches)
+		state.fetched = append(state.fetched, xFetched.Items...)
+		state.summary.Fetched += len(xFetched.Items)
+		state.summary.Errors = append(state.summary.Errors, xFetched.Errs...)
+	}
+	if !state.options.DryRun {
+		discovered := discovery.Fetch(ctx, &http.Client{Timeout: state.cfg.HTTPTimeout()}, state.cfg.Settings.MaxItemsPerFeed)
+		state.fetched = append(state.fetched, discovered.Items...)
+		state.summary.Fetched += len(discovered.Items)
+		state.summary.Errors = append(state.summary.Errors, discovered.Errors...)
 	}
 	if !state.options.DryRun {
 		for _, item := range state.fetched {
@@ -139,25 +330,58 @@ func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
 	if err != nil {
 		return state, err
 	}
+	settings := state.cfg.Settings
+	unlimited := 0
+	settings.MaxCandidatesPerRun = &unlimited
 	filtered := triage.FilterWithFeedback(state.fetched, seenIDs, triage.FeedbackRules{
 		BlockedItemIDs:  feedback.BlockedItemIDs,
 		BlockedFeedURLs: feedback.BlockedFeedURLs,
-	}, state.cfg.Profile, state.cfg.Settings, state.options.IncludeSeen, time.Now())
+	}, state.cfg.Profile, settings, state.options.IncludeSeen, time.Now())
 	state.candidates = filtered.Items
+	state.initial = newestPerFeed(state.candidates, state.cfg.Settings.InitialItemsPerFeed)
 	state.summary.Triage = filtered.Stats
 	state.summary.Candidate = len(state.candidates)
 	return state, nil
 }
 
+func newestPerFeed(items []rss.Item, limit int) []rss.Item {
+	if limit <= 0 {
+		limit = 10
+	}
+	groups := make(map[string][]rss.Item)
+	for _, item := range items {
+		groups[item.FeedURL] = append(groups[item.FeedURL], item)
+	}
+	var selected []rss.Item
+	for _, group := range groups {
+		sort.SliceStable(group, func(i, j int) bool { return group[i].Time().After(group[j].Time()) })
+		if len(group) > limit {
+			group = group[:limit]
+		}
+		selected = append(selected, group...)
+	}
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Time().After(selected[j].Time()) })
+	return selected
+}
+
 func enrichRunNode(ctx context.Context, state *runState) (*runState, error) {
-	if len(state.candidates) == 0 {
+	if len(state.initial) == 0 {
 		return state, nil
 	}
-	fullText := state.fetcher.EnrichFullText(ctx, state.candidates, state.cfg.Settings.FullTextMinChars, state.cfg.Settings.FullTextMaxChars)
-	state.candidates = fullText.Items
+	fullText := state.fetcher.EnrichFullText(ctx, state.initial, state.cfg.Settings.FullTextMinChars, state.cfg.Settings.FullTextMaxChars)
+	state.initial = fullText.Items
+	byID := make(map[string]rss.Item, len(state.initial))
+	for _, item := range state.initial {
+		byID[item.StableID()] = item
+	}
+	for i, item := range state.candidates {
+		if enriched, ok := byID[item.StableID()]; ok {
+			state.candidates[i] = enriched
+		}
+	}
 	state.summary.Errors = append(state.summary.Errors, fullText.Errs...)
 	if !state.options.DryRun {
-		for _, item := range state.candidates {
+		for _, item := range state.initial {
 			if err := state.db.UpsertItem(ctx, item); err != nil {
 				return state, err
 			}
@@ -168,6 +392,9 @@ func enrichRunNode(ctx context.Context, state *runState) (*runState, error) {
 
 func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
 	if len(state.candidates) == 0 {
+		if !state.options.DryRun {
+			_ = state.db.SetAnalysisRunTotals(ctx, state.runID, 0, 0, "completed")
+		}
 		return state, nil
 	}
 	profileHash := state.cfg.ProfileHash()
@@ -178,6 +405,38 @@ func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
 	state.summary.Cached = len(cached)
 	state.decisions = cached
 	if len(uncached) == 0 {
+		if !state.options.DryRun {
+			_ = state.db.SetAnalysisRunTotals(ctx, state.runID, len(cached), len(cached), "completed")
+		}
+		return state, nil
+	}
+	initialIDs := make(map[string]bool, len(state.initial))
+	for _, item := range state.initial {
+		initialIDs[item.StableID()] = true
+	}
+	var foreground []rss.Item
+	for _, item := range uncached {
+		priority := 10
+		if initialIDs[item.StableID()] {
+			priority = 100
+			foreground = append(foreground, item)
+		}
+		if !state.options.DryRun {
+			if _, err := state.db.EnqueueAnalysis(ctx, state.runID, state.options.ProfileID, profileHash, state.cfg.Settings.AnalysisPromptVersion, item, priority); err != nil {
+				return state, err
+			}
+		}
+	}
+	state.summary.Queued = len(uncached) - len(foreground)
+	if !state.options.DryRun {
+		if err := state.db.SetAnalysisRunTotals(ctx, state.runID, len(cached)+len(uncached), len(cached), "initial"); err != nil {
+			return state, err
+		}
+	}
+	if len(foreground) == 0 {
+		if !state.options.DryRun {
+			_ = state.db.SetAnalysisRunStatus(ctx, state.runID, "background")
+		}
 		return state, nil
 	}
 	if err := checkBudget(ctx, state.db, state.cfg); err != nil {
@@ -191,9 +450,29 @@ func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
 	if err != nil {
 		return state, err
 	}
-	fresh, usages, err := rssAgent.AnalyzeWithUsage(ctx, state.cfg.Profile, uncached, state.cfg.Settings.BatchSize)
-	if err != nil {
-		return state, err
+	initialTPM := state.cfg.Settings.AnalysisTPM
+	if state.cfg.Settings.InitialTokenBudget > 0 && state.cfg.Settings.InitialTokenBudget < initialTPM {
+		initialTPM = state.cfg.Settings.InitialTokenBudget
+	}
+	agent.ConfigureRateLimit(state.cfg.Settings.AnalysisRPM, initialTPM)
+	var fresh []agent.Result
+	var usages []agent.Usage
+	for {
+		fresh, usages, err = rssAgent.AnalyzeWithUsage(ctx, state.cfg.Profile, foreground, state.cfg.Settings.BatchSize)
+		if err == nil || len(fresh) > 0 {
+			break
+		}
+		if !isRateLimitError(err) {
+			return state, err
+		}
+		state.summary.RateLimited = len(foreground)
+		timer := time.NewTimer(rateLimitDelay(err))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return state, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	state.summary.Analyzed = len(fresh)
 	if !state.options.DryRun {
@@ -202,78 +481,77 @@ func analyzeRunNode(ctx context.Context, state *runState) (*runState, error) {
 				return state, err
 			}
 		}
+		completedItems := make([]rss.Item, 0, len(fresh))
+		for _, result := range fresh {
+			completedItems = append(completedItems, result.Item)
+		}
+		if err := state.db.CompleteAnalysisItems(ctx, profileHash, completedItems); err != nil {
+			return state, err
+		}
 		cost, err := recordUsageCosts(ctx, state.db, modelCfgs, usages)
 		if err != nil {
 			return state, err
 		}
 		state.summary.LLMCostCNY = cost
+		_ = state.db.SetAnalysisRunStatus(ctx, state.runID, "background")
+	}
+	if err != nil {
+		state.summary.Errors = append(state.summary.Errors, err)
 	}
 	state.decisions = append(state.decisions, fresh...)
 	return state, nil
 }
 
-func pushRunNode(ctx context.Context, state *runState) (*runState, error) {
-	sortResults(state.decisions)
-	selected := selectPushes(state.decisions, state.cfg.Settings.MinScore, state.cfg.Settings.MaxPushes)
-	if state.options.DryRun {
-		state.summary.Pushed = len(selected)
-		fmt.Print(push.FormatMarkdown(selected))
-		return state, nil
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
 	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "429") || strings.Contains(text, "rate limit") || strings.Contains(text, "too many requests")
+}
 
-	pusher := &push.Pusher{
-		Console:            state.cfg.Push.Console,
-		WebhookURL:         state.cfg.WebhookURL(),
-		FeishuWebhookURL:   state.cfg.FeishuWebhookURL(),
-		DingTalkWebhookURL: state.cfg.DingTalkWebhookURL(),
-		TelegramBotToken:   state.cfg.TelegramBotToken(),
-		TelegramChatID:     state.cfg.TelegramChatID(),
-		Email: push.EmailConfig{
-			SMTPHost: state.cfg.Push.Email.SMTPHost,
-			SMTPPort: state.cfg.EmailSMTPPort(),
-			Username: state.cfg.EmailUsername(),
-			Password: state.cfg.EmailPassword(),
-			From:     state.cfg.Push.Email.From,
-			To:       state.cfg.Push.Email.To,
-			Subject:  state.cfg.Push.Email.Subject,
-			StartTLS: state.cfg.EmailStartTLS(),
-		},
-	}
-	deliveries, pushErr := pusher.Push(ctx, selected)
-	pushed := make(map[string]bool, len(selected))
-	for _, delivery := range deliveries {
-		for _, result := range selected {
-			errText := ""
-			if delivery.Err != nil {
-				errText = delivery.Err.Error()
-			}
-			if err := state.db.RecordPush(ctx, result.Item.StableID(), delivery.Channel, delivery.Err == nil, errText); err != nil {
-				return state, err
-			}
-			if delivery.Err == nil {
-				pushed[result.Item.StableID()] = true
-			}
+var retryAfterPattern = regexp.MustCompile(`(?i)retry-after[^0-9]*(\d+)`)
+
+func rateLimitDelay(err error) time.Duration {
+	if match := retryAfterPattern.FindStringSubmatch(err.Error()); len(match) == 2 {
+		if seconds, parseErr := strconv.Atoi(match[1]); parseErr == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
 		}
 	}
-	if len(pushed) > 0 {
-		state.summary.Pushed = len(selected)
+	return time.Minute
+}
+
+func localDayStart(now time.Time, timezone string) time.Time {
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.Local
 	}
-	for _, item := range state.candidates {
-		if err := state.db.MarkSeenForProfile(ctx, state.options.ProfileID, item, pushed[item.StableID()]); err != nil {
-			return state, err
-		}
+	local := now.In(location)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location).UTC()
+}
+
+func digestSlot(now time.Time, timezone string) string {
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.Local
 	}
-	if pushErr != nil {
-		return state, pushErr
+	hour := now.In(location).Hour()
+	if hour < 12 {
+		return "morning"
 	}
-	return state, nil
+	if hour >= 18 {
+		return "evening"
+	}
+	return "manual"
 }
 
 func Watch(ctx context.Context, cfg *config.Config, options RunOptions) error {
 	interval := cfg.Interval()
 	for {
 		started := time.Now()
-		summary, err := RunOnce(ctx, cfg, options)
+		runOptions := options
+		runOptions.CollectOnly = !isDigestWindow(time.Now(), cfg.Profile.Timezone, cfg.Digest.Times)
+		summary, err := RunOnce(ctx, cfg, runOptions)
 		printSummary(summary, err)
 		if err != nil {
 			return err
@@ -291,6 +569,21 @@ func Watch(ctx context.Context, cfg *config.Config, options RunOptions) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func isDigestWindow(now time.Time, timezone string, times []string) bool {
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.Local
+	}
+	local := now.In(location)
+	for _, raw := range times {
+		parsed, err := time.Parse("15:04", raw)
+		if err == nil && local.Hour() == parsed.Hour() {
+			return true
+		}
+	}
+	return false
 }
 
 func selectPushes(results []agent.Result, minScore int, maxPushes int) []agent.Result {
