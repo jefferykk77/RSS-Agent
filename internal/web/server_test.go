@@ -136,6 +136,26 @@ func TestStaticUIAndInvalidProfile(t *testing.T) {
 	if !strings.Contains(string(page), "RSS Agent") {
 		t.Fatal("UI does not contain RSS Agent title")
 	}
+	if !strings.Contains(string(page), "/assets/") {
+		t.Fatal("UI does not reference the Vite asset bundle")
+	}
+	assetStart := strings.Index(string(page), "/assets/")
+	if assetStart < 0 {
+		t.Fatal("unable to locate a Vite asset URL")
+	}
+	assetEnd := strings.Index(string(page)[assetStart:], "\"")
+	if assetEnd < 0 {
+		t.Fatal("unable to locate the end of a Vite asset URL")
+	}
+	assetURL := string(page)[assetStart : assetStart+assetEnd]
+	assetResponse, err := http.Get(server.URL + assetURL)
+	if err != nil {
+		t.Fatalf("GET UI asset error = %v", err)
+	}
+	defer assetResponse.Body.Close()
+	if assetResponse.StatusCode != http.StatusOK || !strings.Contains(assetResponse.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("GET UI asset status=%s cache=%q", assetResponse.Status, assetResponse.Header.Get("Cache-Control"))
+	}
 
 	response, err = http.Get(server.URL + "/api/digest?profile=missing")
 	if err != nil {
