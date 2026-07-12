@@ -1,0 +1,10 @@
+{
+  "name": "rss-agent-claude-reader-prototype",
+  "private": true,
+  "scripts": {
+    "test": "playwright test prototype.spec.js --reporter=line --workers=1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

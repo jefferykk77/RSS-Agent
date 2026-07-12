@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RSS Agent - Claude Reader Prototype</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#reader">跳到文章正文</a>
+  <header class="topbar">
+    <div class="brand-cluster">
+      <button class="icon-button" id="drawer-open" type="button" aria-label="打开来源与历史" title="来源与历史">
+        <i data-lucide="panel-left"></i>
+      </button>
+      <span class="brand-mark" aria-hidden="true">R</span>
+      <strong>RSS Agent</strong>
+      <span class="edition">今日情报</span>
+    </div>
+    <div class="run-state" id="run-state" role="status" aria-live="polite">
+      <span class="status-dot"></span>
+      <span>分析完成 · 14 条</span>
+    </div>
+    <div class="top-actions">
+      <button class="secondary-button" id="feed-button" type="button">
+        <i data-lucide="link-2"></i><span>投喂</span>
+      </button>
+      <button class="secondary-button" type="button">
+        <i data-lucide="command"></i><span>命令</span><kbd>Ctrl K</kbd>
+      </button>
+      <button class="primary-button" id="run-button" type="button">
+        <i data-lucide="play"></i><span>立即运行</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="queue" aria-label="文章队列">
+      <header class="queue-header">
+        <div>
+          <p class="eyebrow">TODAY'S INTELLIGENCE</p>
+          <h1>值得读的内容</h1>
+        </div>
+        <span class="count" id="article-count">4 篇</span>
+      </header>
+      <div class="queue-tools">
+        <label class="search-field">
+          <i data-lucide="search"></i>
+          <span class="sr-only">搜索文章</span>
+          <input id="search" type="search" placeholder="搜索标题、来源或标签">
+          <kbd>/</kbd>
+        </label>
+        <div class="tabs" role="tablist" aria-label="文章范围">
+          <button class="tab is-active" type="button" data-view="all" role="tab" aria-selected="true">全部</button>
+          <button class="tab" type="button" data-view="recommended" role="tab" aria-selected="false">推荐</button>
+          <button class="tab" type="button" data-view="saved" role="tab" aria-selected="false">收藏</button>
+        </div>
+      </div>
+      <div class="article-list" id="article-list" role="listbox" aria-label="文章列表"></div>
+    </section>
+
+    <article class="reader" id="reader" tabindex="-1">
+      <div class="reader-inner">
+        <header class="article-header">
+          <div class="source-line">
+            <span class="source-avatar" id="source-avatar">O</span>
+            <span id="source-name">OpenAI News</span>
+            <span aria-hidden="true">·</span>
+            <time id="article-age">3 小时前</time>
+          </div>
+          <h2 id="article-title">编码评测的信号与噪声：SWE-Bench Pro 暴露了什么</h2>
+          <p class="dek" id="article-dek">一个看似基准测试的问题，实际会改变我们判断 Coding Agent 能力的方式。</p>
+          <div class="article-toolbar" aria-label="文章操作">
+            <button class="feedback-button" type="button" data-feedback="like" aria-pressed="false"><i data-lucide="thumbs-up"></i><span>有用</span></button>
+            <button class="feedback-button" type="button" data-feedback="save" aria-pressed="false"><i data-lucide="bookmark"></i><span>收藏</span></button>
+            <button class="feedback-button" type="button" data-feedback="later" aria-pressed="false"><i data-lucide="clock-3"></i><span>稍后</span></button>
+            <span class="toolbar-spacer"></span>
+            <button class="text-button" type="button"><i data-lucide="external-link"></i><span>打开原文</span></button>
+          </div>
+        </header>
+
+        <section class="analysis-band" aria-labelledby="analysis-title">
+          <div class="analysis-heading">
+            <span class="spark" aria-hidden="true">✦</span>
+            <div><p class="eyebrow">AGENT BRIEF</p><h3 id="analysis-title">为什么值得读</h3></div>
+            <span class="score-badge"><span id="score">9</span><small>/10</small></span>
+          </div>
+          <p class="why" id="article-why">这篇一手研究揭示了编码基准中的可靠性缺口。它不是又一条模型发布新闻，而是会直接影响 Codex 选型、评估和上线判断的方法论。</p>
+          <div class="analysis-grid">
+            <div>
+              <h4>一句话结论</h4>
+              <p id="article-summary">先审计评测数据，再相信排行榜；Agent 的真实能力不能只由单一通过率代表。</p>
+            </div>
+            <div>
+              <h4>立即行动</h4>
+              <p id="article-action">为现有 Coding Agent 增加一组来自真实仓库、可复查失败原因的内部评测。</p>
+            </div>
+          </div>
+          <ul class="key-points" id="key-points"></ul>
+          <div class="tag-list" id="tag-list"></div>
+        </section>
+
+        <section class="article-body" aria-labelledby="body-heading">
+          <div class="section-heading"><p class="eyebrow">SOURCE</p><h3 id="body-heading">原文摘录</h3></div>
+          <div id="article-content"></div>
+          <pre><code>evaluation = {
+  "dataset": "audited-real-repos",
+  "inspect_failures": true,
+  "report_uncertainty": true
+}</code></pre>
+        </section>
+      </div>
+    </article>
+  </main>
+
+  <div class="drawer-scrim" id="drawer-scrim" hidden></div>
+  <aside class="library-drawer" id="library-drawer" aria-label="来源与历史" aria-hidden="true">
+    <header class="drawer-header">
+      <div><p class="eyebrow">LIBRARY</p><h2>来源与历史</h2></div>
+      <button class="icon-button icon-button-dark" id="drawer-close" type="button" aria-label="关闭来源与历史"><i data-lucide="x"></i></button>
+    </header>
+    <label class="drawer-field">Profile<select><option>default</option></select></label>
+    <nav class="drawer-nav" aria-label="内容集合">
+      <button class="drawer-link is-active" type="button"><i data-lucide="inbox"></i><span>今日 Digest</span><b>14</b></button>
+      <button class="drawer-link" type="button"><i data-lucide="bookmark"></i><span>已收藏</span><b>3</b></button>
+      <button class="drawer-link" type="button"><i data-lucide="clock-3"></i><span>稍后阅读</span><b>2</b></button>
+    </nav>
+    <div class="drawer-section-title"><span>订阅源</span><button type="button" aria-label="添加来源"><i data-lucide="plus"></i></button></div>
+    <div class="source-list">
+      <button type="button"><span class="health healthy"></span><span>OpenAI News</span><small>12</small></button>
+      <button type="button"><span class="health limited"></span><span>Reddit · Claude Engineering</span><small>受限</small></button>
+      <button type="button"><span class="health healthy"></span><span>Anthropic News</span><small>8</small></button>
+      <button type="button"><span class="health healthy"></span><span>GitHub · Skills & MCP</span><small>20</small></button>
+      <button type="button"><span class="health healthy"></span><span>Hugging Face Blog</span><small>6</small></button>
+    </div>
+    <div class="drawer-history">
+      <p class="drawer-section-title"><span>历史 Digest</span></p>
+      <button type="button"><span>今天 · 早报</span><small>8 篇</small></button>
+      <button type="button"><span>昨天 · 晚报</span><small>6 篇</small></button>
+    </div>
+  </aside>
+
+  <dialog id="feed-dialog">
+    <form method="dialog" class="dialog-surface">
+      <header><div><p class="eyebrow">INTEREST SAMPLE</p><h2>投喂一条内容</h2></div><button class="icon-button" value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></header>
+      <label>文章或 X 链接<input type="url" placeholder="https://..."></label>
+      <label>补充说明<textarea rows="4" placeholder="为什么这篇内容值得关注"></textarea></label>
+      <footer><button class="secondary-button" value="cancel">取消</button><button class="primary-button" value="default">加入兴趣样本</button></footer>
+    </form>
+  </dialog>
+</body>
+</html>

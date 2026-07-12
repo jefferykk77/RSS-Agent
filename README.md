@@ -247,6 +247,24 @@ go run ./cmd/rss-agent serve
 # 打开 http://127.0.0.1:8787
 ```
 
+Web 前端使用 React、TypeScript 和 Vite，生产构建产物提交在 `internal/web/static/dist` 并由 Go 嵌入，因此普通运行和发布不需要 Node。开发前端时：
+
+```powershell
+cd webui
+npm install
+npm run dev
+# Vite 默认打开 http://127.0.0.1:5173，并将 /api 代理到 8787
+```
+
+提交前更新嵌入产物并执行前端测试：
+
+```powershell
+cd webui
+npm test
+npm run build
+npm run test:e2e
+```
+
 ## AI 情报调度
 
 `watch` 每小时增量抓取和分析，Digest 时间仍用于形成早报/晚报历史。当前版本不连接任何第三方推送渠道：

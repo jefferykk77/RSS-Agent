@@ -2,12 +2,14 @@ package web
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,14 +24,8 @@ import (
 	xsource "github.com/jeffery/rss-agent/internal/x"
 )
 
-//go:embed static/index.html
-var indexHTML []byte
-
-//go:embed static/app.js
-var appJS []byte
-
-//go:embed static/styles.css
-var stylesCSS []byte
+//go:embed static/dist
+var builtUI embed.FS
 
 type Server struct {
 	config *config.Config
@@ -656,16 +652,24 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	switch r.URL.Path {
-	case "/", "/index.html":
-		serveAsset(w, r, "text/html; charset=utf-8", indexHTML)
-	case "/app.js":
-		serveAsset(w, r, "text/javascript; charset=utf-8", appJS)
-	case "/styles.css":
-		serveAsset(w, r, "text/css; charset=utf-8", stylesCSS)
-	default:
-		http.NotFound(w, r)
+	assetPath := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+	if assetPath == "." || assetPath == "" {
+		assetPath = "index.html"
 	}
+	content, err := builtUI.ReadFile("static/dist/" + assetPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	contentType := mime.TypeByExtension(path.Ext(assetPath))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	cacheControl := "public, max-age=31536000, immutable"
+	if assetPath == "index.html" {
+		cacheControl = "no-store"
+	}
+	serveAsset(w, r, contentType, cacheControl, content)
 }
 
 func (s *Server) resolveProfile(name string) (*config.Config, string, error) {
@@ -783,9 +787,9 @@ func requireEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func serveAsset(w http.ResponseWriter, r *http.Request, contentType string, content []byte) {
+func serveAsset(w http.ResponseWriter, r *http.Request, contentType, cacheControl string, content []byte) {
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", cacheControl)
 	if r.Method == http.MethodHead {
 		return
 	}
