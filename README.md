@@ -1,5 +1,6 @@
 # RSS Agent
-<img width="2559" height="1469" alt="image" src="https://github.com/user-attachments/assets/8ca28a06-e25f-4677-8223-b22f8418f108" />
+<img width="2542" height="1468" alt="image" src="https://github.com/user-attachments/assets/74f5f9fa-f39a-425a-8662-c2429788262f" />
+
 
 一个本地优先的 Go + Eino RSS Agent：抓取订阅源，先在本地筛选与去重，再调用你自己的 LLM 做评分和摘要，只推值得看的内容。
 
