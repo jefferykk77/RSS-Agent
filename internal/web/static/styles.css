@@ -441,11 +441,6 @@ kbd {
   font-weight: 600;
 }
 
-.score.is-recommended {
-  color: #ffffff;
-  background: var(--accent);
-}
-
 .digest-row__body {
   min-width: 0;
 }

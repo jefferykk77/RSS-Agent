@@ -105,6 +105,13 @@ func AnalyzeSavedItem(ctx context.Context, cfg *config.Config, profileID string,
 	if feedback.BlockedItemIDs[item.StableID()] || feedback.BlockedFeedURLs[item.FeedURL] {
 		return RunSummary{}, fmt.Errorf("item %q is blocked by feedback", itemID)
 	}
+	fullText := rss.NewFetcher(cfg.HTTPTimeout()).EnrichFullText(ctx, []rss.Item{item}, cfg.Settings.FullTextMinChars, cfg.Settings.FullTextMaxChars)
+	if len(fullText.Items) > 0 {
+		item = fullText.Items[0]
+		if err := db.UpsertItem(ctx, item); err != nil {
+			return RunSummary{}, err
+		}
+	}
 
 	summary := RunSummary{Candidate: 1}
 	cached, uncached, err := splitCached(ctx, db, []rss.Item{item}, cfg.ProfileHash(), cfg.AnalysisCacheTTL())
@@ -304,28 +311,39 @@ func fetchRunNode(ctx context.Context, state *runState) (*runState, error) {
 		state.summary.Fetched += len(discovered.Items)
 		state.summary.Errors = append(state.summary.Errors, discovered.Errors...)
 	}
+	cutoff := retentionCutoff(time.Now(), state.cfg.Profile.Timezone, state.cfg.Settings.RetentionDays)
+	kept := state.fetched[:0]
+	for _, item := range state.fetched {
+		if item.Time().IsZero() || !item.Time().Before(cutoff) {
+			kept = append(kept, item)
+		}
+	}
+	state.fetched = kept
 	if !state.options.DryRun {
-		for _, item := range state.fetched {
-			if err := state.db.UpsertItem(ctx, item); err != nil {
-				return state, err
-			}
-			if err := state.db.UpsertProfileItem(ctx, state.options.ProfileID, item); err != nil {
-				return state, err
-			}
+		if err := state.db.UpsertItemsForProfile(ctx, state.options.ProfileID, state.fetched); err != nil {
+			return state, err
+		}
+		if _, err := state.db.CleanupOldItems(ctx, state.options.ProfileID, cutoff); err != nil {
+			return state, err
 		}
 	}
 	return state, nil
 }
 
-func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
-	seenIDs := map[string]bool{}
-	if !state.options.IncludeSeen {
-		var err error
-		seenIDs, err = state.db.SeenIDsForProfile(ctx, state.options.ProfileID)
-		if err != nil {
-			return state, err
-		}
+func retentionCutoff(now time.Time, timezone string, days int) time.Time {
+	if days <= 0 {
+		days = 2
 	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.Local
+	}
+	local := now.In(location)
+	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	return start.AddDate(0, 0, -(days - 1))
+}
+
+func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
 	feedback, err := state.db.FeedbackFiltersForProfile(ctx, state.options.ProfileID)
 	if err != nil {
 		return state, err
@@ -333,12 +351,13 @@ func filterRunNode(ctx context.Context, state *runState) (*runState, error) {
 	settings := state.cfg.Settings
 	unlimited := 0
 	settings.MaxCandidatesPerRun = &unlimited
-	filtered := triage.FilterWithFeedback(state.fetched, seenIDs, triage.FeedbackRules{
+	filtered := triage.FilterWithFeedback(state.fetched, map[string]bool{}, triage.FeedbackRules{
 		BlockedItemIDs:  feedback.BlockedItemIDs,
 		BlockedFeedURLs: feedback.BlockedFeedURLs,
 	}, state.cfg.Profile, settings, state.options.IncludeSeen, time.Now())
 	state.candidates = filtered.Items
 	state.initial = newestPerFeed(state.candidates, state.cfg.Settings.InitialItemsPerFeed)
+	state.candidates = append([]rss.Item(nil), state.initial...)
 	state.summary.Triage = filtered.Stats
 	state.summary.Candidate = len(state.candidates)
 	return state, nil

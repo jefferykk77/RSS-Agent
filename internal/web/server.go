@@ -57,6 +57,7 @@ type digestResponse struct {
 	Profile    string       `json:"profile"`
 	Items      []digestItem `json:"items"`
 	NextCursor string       `json:"next_cursor,omitempty"`
+	Total      int          `json:"total"`
 }
 
 type digestItem struct {
@@ -131,9 +132,11 @@ type ingestRequest struct {
 type sourceHealthResponse struct {
 	URL           string `json:"url"`
 	Status        int    `json:"status"`
+	State         string `json:"state"`
 	LastError     string `json:"last_error"`
 	FailCount     int    `json:"fail_count"`
 	LastFetchedAt string `json:"last_fetched_at"`
+	NextRetryAt   string `json:"next_retry_at"`
 }
 
 type editionResponse struct {
@@ -147,9 +150,24 @@ type editionResponse struct {
 func New(cfg *config.Config, db *store.DB) *Server {
 	server := &Server{config: cfg, db: db, running: map[string]bool{}, background: map[string]bool{}}
 	for _, profileID := range cfg.ProfileNames() {
+		if resolved, err := cfg.ResolveProfile(profileID); err == nil {
+			_, _ = db.CleanupOldItems(context.Background(), profileID, webRetentionCutoff(time.Now(), resolved.Profile.Timezone, resolved.Settings.RetentionDays))
+		}
 		_, _ = db.EnsureRecoveryRun(context.Background(), profileID)
 	}
 	return server
+}
+
+func webRetentionCutoff(now time.Time, timezone string, days int) time.Time {
+	if days <= 0 {
+		days = 2
+	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.Local
+	}
+	local := now.In(location)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location).AddDate(0, 0, -(days - 1))
 }
 
 func (s *Server) Handler() http.Handler {
@@ -240,13 +258,38 @@ func (s *Server) handleSourceHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := make([]sourceHealthResponse, 0, len(states))
+	active := map[string]bool{}
+	for _, profileID := range s.config.ProfileNames() {
+		if resolved, resolveErr := s.config.ResolveProfile(profileID); resolveErr == nil {
+			for _, feed := range resolved.EnabledFeeds() {
+				active[feed.URL] = true
+			}
+		}
+	}
 	for _, state := range states {
+		if !active[state.URL] {
+			continue
+		}
 		response = append(response, sourceHealthResponse{
 			URL: state.URL, Status: state.Status, LastError: state.LastError,
-			FailCount: state.FailCount, LastFetchedAt: timeValue(state.LastFetchedAt),
+			State: sourceHealthState(state), FailCount: state.FailCount,
+			LastFetchedAt: timeValue(state.LastFetchedAt), NextRetryAt: timeValue(state.NextRetryAt),
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func sourceHealthState(state store.SourceHealth) string {
+	if state.Status == http.StatusTooManyRequests && state.NextRetryAt.After(time.Now()) {
+		return "rate_limited"
+	}
+	if state.FailCount > 0 {
+		return "error"
+	}
+	if state.Status >= 200 && state.Status < 400 {
+		return "healthy"
+	}
+	return "unknown"
 }
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -293,19 +336,19 @@ func (s *Server) handleDigest(w http.ResponseWriter, r *http.Request) {
 	}
 	order := strings.TrimSpace(r.URL.Query().Get("order"))
 	if order == "" {
-		order = "newest"
+		order = "hybrid"
 	}
-	if order != "newest" && order != "recommended" {
-		writeError(w, http.StatusBadRequest, errors.New("order must be newest or recommended"))
+	if order != "newest" && order != "hybrid" && order != "recommended" {
+		writeError(w, http.StatusBadRequest, errors.New("order must be hybrid, newest or recommended"))
 		return
 	}
-	page, err := s.db.DigestPageForProfile(r.Context(), profileID, resolved.ProfileHash(), order, limit, r.URL.Query().Get("cursor"))
+	page, err := s.db.DigestPageForProfile(r.Context(), profileID, resolved.ProfileHash(), r.URL.Query().Get("source"), order, limit, r.URL.Query().Get("cursor"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	items := page.Items
-	response := digestResponse{Profile: profileID, Items: make([]digestItem, 0, len(items)), NextCursor: page.NextCursor}
+	response := digestResponse{Profile: profileID, Items: make([]digestItem, 0, len(items)), NextCursor: page.NextCursor, Total: page.Total}
 	editionID := strings.TrimSpace(r.URL.Query().Get("edition"))
 	allowed := map[string]bool{}
 	if editionID != "" {

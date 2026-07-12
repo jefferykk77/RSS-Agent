@@ -17,9 +17,12 @@ const state = {
   loading: false,
   loadingMore: false,
   nextCursor: "",
+  total: 0,
   run: { status: "idle", analyzed: 0, pending: 0, running: 0, retrying: 0, rate_limited: 0, failed: 0 },
   pollingActive: true,
   lastBackgroundPoll: 0,
+  operationStatus: "",
+  operationUntil: 0,
 };
 
 const elements = {
@@ -70,9 +73,10 @@ async function loadWorkspace(profile = state.profile, selectedID = state.selecte
   try {
     const query = new URLSearchParams({ profile });
 	if (state.edition) query.set("edition", state.edition);
+	if (state.sourceFilter) query.set("source",state.sourceFilter);
     const [bootstrap, digest, sourceStates, editions, run] = await Promise.all([
       request(`/api/bootstrap?${query}`),
-	  request(`/api/digest?${query}&limit=30&order=${state.view === "recommended" ? "recommended" : "newest"}`),
+	  request(`/api/digest?${query}&limit=30&order=${state.view === "recommended" ? "recommended" : "hybrid"}`),
 	  request("/api/sources/health"),
 	  request(`/api/editions?profile=${encodeURIComponent(profile)}`),
 	  request(`/api/analysis-runs/current?profile=${encodeURIComponent(profile)}`),
@@ -86,6 +90,7 @@ async function loadWorkspace(profile = state.profile, selectedID = state.selecte
 	state.run = run || state.run;
 	state.pollingActive = !["completed", "partial_failed", "idle"].includes(state.run.status);
 	state.nextCursor = digest.next_cursor || "";
+	state.total = Number(digest.total || state.items.length);
     state.selectedID = state.items.some((item) => item.id === selectedID) ? selectedID : state.items[0]?.id || "";
     renderWorkspace();
   } catch (error) {
@@ -101,12 +106,14 @@ async function loadMoreItems() {
   if (state.loading || state.loadingMore || !state.nextCursor || state.edition) return;
   state.loadingMore = true;
   try {
-    const query = new URLSearchParams({ profile: state.profile, limit: "30", cursor: state.nextCursor, order: state.view === "recommended" ? "recommended" : "newest" });
+	const query = new URLSearchParams({ profile: state.profile, limit: "30", cursor: state.nextCursor, order: state.view === "recommended" ? "recommended" : "hybrid" });
+	if(state.sourceFilter)query.set("source",state.sourceFilter);
     const digest = await request(`/api/digest?${query}`);
     const incoming = (digest.items || []).map(normalizeItem);
     const known = new Set(state.items.map((item) => item.id));
     state.items.push(...incoming.filter((item) => !known.has(item.id)));
     state.nextCursor = digest.next_cursor || "";
+	state.total = Number(digest.total || state.total);
     renderWorkspace();
     const pending = incoming.filter((item) => item.analysis_status !== "completed").map((item) => item.id);
     if (pending.length) {
@@ -127,16 +134,20 @@ async function refreshAnalysis() {
     if (state.selectedID && !visible.includes(state.selectedID)) visible.push(state.selectedID);
     const query = new URLSearchParams({ profile: state.profile });
     for (const id of visible.slice(0, 100)) query.append("item_id", id);
-    const [run, updates] = await Promise.all([request(`/api/analysis-runs/current?profile=${encodeURIComponent(state.profile)}`), visible.length ? request(`/api/digest/updates?${query}`) : Promise.resolve({ items: [] })]);
+    const previousAnalyzed=state.run.analyzed||0;
+	const [run, updates] = await Promise.all([request(`/api/analysis-runs/current?profile=${encodeURIComponent(state.profile)}`), visible.length ? request(`/api/digest/updates?${query}`) : Promise.resolve({ items: [] })]);
     state.run = run;
     const byID = new Map((updates.items || []).map((item) => [item.id, normalizeItem(item)]));
     let changed = false;
     state.items = state.items.map((item) => { const update = byID.get(item.id); if (!update) return item; if (update.analyzed_at !== item.analyzed_at || update.analysis_status !== item.analysis_status) { changed = true; return update; } return item; });
-    if (changed) { const top = elements.digestList.scrollTop; renderDigest(); elements.digestList.scrollTop = top; renderDetail(); }
+	if ((run.analyzed||0)>previousAnalyzed){await reloadSortedItems();changed=false}
+	else if (changed) { const top = elements.digestList.scrollTop; renderDigest(); elements.digestList.scrollTop = top; renderDetail(); }
     state.pollingActive = !["completed", "partial_failed", "idle"].includes(run.status);
     renderNavigation();
   } catch (_) {}
 }
+
+async function reloadSortedItems(){const anchor=state.selectedID;const query=new URLSearchParams({profile:state.profile,limit:"30",order:state.view==="recommended"?"recommended":"hybrid"});if(state.sourceFilter)query.set("source",state.sourceFilter);const digest=await request(`/api/digest?${query}`);state.items=(digest.items||[]).map(normalizeItem);state.nextCursor=digest.next_cursor||"";state.total=Number(digest.total||state.items.length);if(anchor&&state.items.some((item)=>item.id===anchor))state.selectedID=anchor;renderDigest();renderDetail();document.querySelector(`[data-item-id="${cssEscape(state.selectedID)}"]`)?.scrollIntoView({block:"nearest"});}
 
 function renderWorkspace() {
   renderProfiles();
@@ -184,6 +195,12 @@ function renderSources() {
 	const health = state.sourceStates.find((entry) => entry.url === feed.url);
     const button = makeSourceButton(feed.url, feed.name, feed.disabled ? "circle-off" : health?.fail_count ? "circle-alert" : "rss");
     const sourceButton = button.querySelector(".source-item");
+	if (health?.state === "rate_limited") {
+	  const retryAt = health.next_retry_at ? new Date(health.next_retry_at).toLocaleString("zh-CN", { hour12: false }) : "稍后";
+	  sourceButton.title = `最近抓取被限流；${retryAt} 后可在下次立即运行时重试`;
+	} else if (health?.fail_count) {
+	  sourceButton.title = `最近抓取失败：${health.last_error || "未知错误"}`;
+	}
     sourceButton.classList.toggle("is-active", feed.url === state.sourceFilter);
     sourceButton.disabled = feed.disabled;
     elements.sourceList.append(button);
@@ -210,12 +227,12 @@ function makeSourceButton(url, name, iconName) {
 
 function renderNavigation() {
   const filtered = filteredItems();
-  elements.digestCount.textContent = String(filtered.length);
+  elements.digestCount.textContent = String(state.total || filtered.length);
 	const pending = (state.run.pending || 0) + (state.run.running || 0) + (state.run.retrying || 0);
 	const progress = `已分析 ${state.run.analyzed || 0} / 待分析 ${pending}${state.run.rate_limited ? ` / 等待额度 ${state.run.rate_limited}` : ""}${state.run.failed ? ` / 失败 ${state.run.failed}` : ""}`;
   elements.digestMeta.textContent = state.items.length ? `${state.items.length} 条已加载 · ${progress}` : "等待首次运行";
 	const labels = { initial: "首批分析中", background: "后台分析中", rate_limited: "等待模型额度", completed: "运行完成", partial_failed: "部分完成", idle: "本地工作台" };
-	if (!state.loading) elements.runStatus.textContent = labels[state.run.status] || "本地工作台";
+	if (!state.loading) elements.runStatus.textContent = state.operationStatus&&Date.now()<state.operationUntil?state.operationStatus:(labels[state.run.status] || "本地工作台");
   for (const button of document.querySelectorAll(".nav-item[data-filter]")) {
     button.classList.toggle("is-active", button.dataset.filter === state.collectionFilter);
   }
@@ -251,7 +268,6 @@ function makeDigestRow(item) {
   const score = document.createElement("span");
   score.className = "score";
   score.textContent = item.analysis_status === "completed" ? String(item.score) : "…";
-  score.classList.toggle("is-recommended", item.should_push);
   row.append(score);
 
   const body = document.createElement("span");
@@ -731,7 +747,7 @@ async function updateFeedback(itemID, action) {
 }
 
 async function runNow() {
-  if (state.loading || !window.confirm(`立即运行 Profile “${state.profile}”？这会抓取订阅并调用已配置的模型。`)) {
+  if (state.loading) {
     return;
   }
   elements.runButton.disabled = true;
@@ -752,19 +768,22 @@ async function runNow() {
 
 async function analyzeItem(itemID) {
   const item = state.items.find((entry) => entry.id === itemID);
-  if (!item || !window.confirm(`分析“${displayTitle(item)}”？这会调用已配置的模型，但不会自动推送。`)) {
+  if (!item) {
     return;
   }
-  elements.runStatus.textContent = "正在分析";
+	const buttons=[...document.querySelectorAll(`[data-analyze-item-id="${cssEscape(itemID)}"]`)];buttons.forEach((button)=>button.disabled=true);
+	state.operationStatus="分析此条";state.operationUntil=Date.now()+3600000;elements.runStatus.textContent="分析此条";
   try {
     const query = new URLSearchParams({ profile: state.profile, item_id: itemID });
     const result = await request(`/api/analyze?${query}`, { method: "POST" });
-    showToast(result.cached ? "已使用现有分析结果" : "分析完成");
+	state.operationStatus="分析完成";state.operationUntil=Date.now()+3000;elements.runStatus.textContent="分析完成";
+	showToast(result.cached ? "已使用现有分析结果" : "分析完成");
     await loadWorkspace(state.profile, itemID);
+	document.querySelector(`[data-item-id="${cssEscape(itemID)}"]`)?.scrollIntoView({block:"start"});
   } catch (error) {
     showToast(error.message, true);
-    elements.runStatus.textContent = "分析失败";
-  }
+	state.operationStatus="分析失败";state.operationUntil=Date.now()+4000;elements.runStatus.textContent="分析失败";
+	}finally{buttons.forEach((button)=>button.disabled=false)}
 }
 
 function openIngestDialog() {
@@ -946,9 +965,7 @@ document.addEventListener("click", (event) => {
     state.collectionFilter = "all";
     state.view = "all";
     state.sourceFilter = source.dataset.source;
-    renderNavigation();
-    renderSources();
-    renderDigest();
+	state.nextCursor="";loadWorkspace(state.profile,"");
     return;
   }
   const command = event.target.closest("[data-command]");

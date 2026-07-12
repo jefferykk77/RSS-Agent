@@ -92,6 +92,7 @@ type Settings struct {
 	AnalysisRPM           int    `yaml:"analysis_rpm,omitempty"`
 	AnalysisTPM           int    `yaml:"analysis_tpm,omitempty"`
 	InitialTokenBudget    int    `yaml:"initial_token_budget,omitempty"`
+	RetentionDays         int    `yaml:"retention_days,omitempty"`
 }
 
 type Database struct {
@@ -244,9 +245,6 @@ func (c *Config) ApplyDefaults() {
 	if c.Settings.LookbackHours == 0 {
 		c.Settings.LookbackHours = 72
 	}
-	if c.Settings.MaxItemsPerFeed == 0 {
-		c.Settings.MaxItemsPerFeed = 20
-	}
 	if c.Settings.BatchSize == 0 {
 		c.Settings.BatchSize = 8
 	}
@@ -269,7 +267,7 @@ func (c *Config) ApplyDefaults() {
 		c.Settings.FullTextMaxChars = 8000
 	}
 	if c.Settings.InitialItemsPerFeed == 0 {
-		c.Settings.InitialItemsPerFeed = 10
+		c.Settings.InitialItemsPerFeed = 3
 	}
 	if c.Settings.AnalysisRPM == 0 {
 		c.Settings.AnalysisRPM = 400
@@ -279,6 +277,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Settings.InitialTokenBudget == 0 {
 		c.Settings.InitialTokenBudget = 700000
+	}
+	if c.Settings.RetentionDays == 0 {
+		c.Settings.RetentionDays = 2
 	}
 	if len(c.X.Searches) > 0 {
 		if c.X.BaseURL == "" {
@@ -847,7 +848,7 @@ func Sample() *Config {
 			Interval:            "30m",
 			HTTPTimeout:         "20s",
 			LookbackHours:       72,
-			MaxItemsPerFeed:     20,
+			MaxItemsPerFeed:     0,
 			BatchSize:           8,
 			MinScore:            7,
 			MaxPushes:           8,

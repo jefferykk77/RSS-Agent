@@ -57,7 +57,7 @@ go run ./cmd/rss-agent once
 
 若 RSS 提供的摘要和正文少于 `full_text_min_chars`（默认 600），Agent 会仅为通过本地筛选的候选文章抓取链接页的 HTML 正文。提取并清洗后的正文最多保留 `full_text_max_chars`（默认 8000）个字符，页面响应体限制为 2 MiB，抓取失败只会记录为警告。
 
-“立即运行”会拉取每个来源最多 20 条，并同步完成每个来源最新 10 条的评分。其余内容进入后台队列，滚动加载时会自动提权。模型调用共享 `400 RPM / 800,000 TPM` 的保守限流器：
+“立即运行”会读取普通 Feed 当前响应中的全部条目，只保留北京时间今天和昨天，并同步完成每个来源最新 3 条的评分。其余内容只保存摘要，用户点击“分析此条”时才补抓全文并调用模型。模型调用共享 `400 RPM / 800,000 TPM` 的保守限流器：
 
 每次运行都有独立进度记录。Web 会原地更新当前可见文章，并区分待分析、正在重试、等待模型额度和失败；模型返回的数字字符串、小数或越界 `score` 会自动规范化到 `0–10`，不会因这一字段反复消耗额度。
 
@@ -68,7 +68,9 @@ profile:
   muted_tags: [招聘, 营销]
 settings:
   max_candidates_per_run: 0
-  initial_items_per_feed: 10
+  max_items_per_feed: 0
+  initial_items_per_feed: 3
+  retention_days: 2
   analysis_rpm: 400
   analysis_tpm: 800000
   initial_token_budget: 700000
@@ -263,7 +265,7 @@ digest:
 go run ./cmd/rss-agent serve -addr 127.0.0.1:8790
 ```
 
-页面上的“立即运行”会调用与 `rss-agent once` 相同的真实抓取和分析流程，可能产生模型费用；抓取成功的文章即使尚未评分也会保存在 SQLite。
+页面上的“立即运行”会调用与 `rss-agent once` 相同的真实抓取和分析流程，可能产生模型费用；收藏、稍后阅读、手动投喂及历史 Digest 入选文章不会被两日清理删除。
 
 ## 命令速查
 

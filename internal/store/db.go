@@ -105,6 +105,7 @@ type SourceHealth struct {
 	LastError     string
 	FailCount     int
 	LastFetchedAt time.Time
+	NextRetryAt   time.Time
 }
 
 type DigestEdition struct {
@@ -158,9 +159,10 @@ type AnalysisRun struct {
 type DigestPage struct {
 	Items      []DigestItem
 	NextCursor string
+	Total      int
 }
 
-func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, order string, limit int, cursor string) (DigestPage, error) {
+func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, source, order string, limit int, cursor string) (DigestPage, error) {
 	if limit <= 0 {
 		limit = 30
 	}
@@ -171,24 +173,26 @@ func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, 
 	if err != nil {
 		return DigestPage{}, err
 	}
-	if order == "newest" {
-		sort.SliceStable(all, func(i, j int) bool { return all[i].PublishedAt.After(all[j].PublishedAt) })
-		counts := map[string]int{}
-		first := make([]DigestItem, 0, len(all))
-		overflow := make([]DigestItem, 0, len(all))
-		for _, item := range all {
-			if counts[item.FeedURL] < 10 {
-				counts[item.FeedURL]++
-				first = append(first, item)
-			} else {
-				overflow = append(overflow, item)
-			}
+	visible := all[:0]
+	for _, item := range all {
+		if item.FeedURL != "https://github.com/openai/codex/releases.atom" {
+			visible = append(visible, item)
 		}
-		all = append(first, overflow...)
-	} else {
+	}
+	all = visible
+	if source != "" {
 		filtered := all[:0]
 		for _, item := range all {
-			if !item.AnalyzedAt.IsZero() {
+			if item.FeedURL == source {
+				filtered = append(filtered, item)
+			}
+		}
+		all = filtered
+	}
+	if order == "recommended" {
+		filtered := all[:0]
+		for _, item := range all {
+			if !item.AnalyzedAt.IsZero() && item.ShouldPush {
 				filtered = append(filtered, item)
 			}
 		}
@@ -198,6 +202,19 @@ func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, 
 				return all[i].PublishedAt.After(all[j].PublishedAt)
 			}
 			return all[i].Score > all[j].Score
+		})
+	} else if order == "newest" {
+		sort.SliceStable(all, func(i, j int) bool { return all[i].PublishedAt.After(all[j].PublishedAt) })
+	} else {
+		sort.SliceStable(all, func(i, j int) bool {
+			ai, aj := !all[i].AnalyzedAt.IsZero(), !all[j].AnalyzedAt.IsZero()
+			if ai != aj {
+				return ai
+			}
+			if ai && all[i].Score != all[j].Score {
+				return all[i].Score > all[j].Score
+			}
+			return all[i].PublishedAt.After(all[j].PublishedAt)
 		})
 	}
 	offset := 0
@@ -211,7 +228,7 @@ func (db *DB) DigestPageForProfile(ctx context.Context, profileID, profileHash, 
 	if end > len(all) {
 		end = len(all)
 	}
-	page := DigestPage{Items: append([]DigestItem(nil), all[offset:end]...)}
+	page := DigestPage{Items: append([]DigestItem(nil), all[offset:end]...), Total: len(all)}
 	if end < len(all) {
 		page.NextCursor = fmt.Sprintf("%d", end)
 	}
@@ -445,6 +462,9 @@ func (db *DB) migrate() error {
 	if err := db.ensureColumn("analysis_tasks", "run_id", "INTEGER"); err != nil {
 		return err
 	}
+	if err := db.ensureColumn("feed_fetch_states", "next_retry_at", "TEXT"); err != nil {
+		return err
+	}
 	legacyMigrations := []string{
 		`INSERT OR IGNORE INTO profile_items (profile_id, item_id, added_at)
 			SELECT 'default', id, updated_db_at FROM items`,
@@ -484,25 +504,26 @@ func (db *DB) ensureColumn(table, column, definition string) error {
 }
 
 func (db *DB) GetFeedState(ctx context.Context, feedURL string) (rss.FeedFetchState, bool, error) {
-	row := db.sql.QueryRowContext(ctx, `SELECT feed_url, etag, last_modified, last_status, last_error, fail_count, last_fetched_at
+	row := db.sql.QueryRowContext(ctx, `SELECT feed_url, etag, last_modified, last_status, last_error, fail_count, last_fetched_at, COALESCE(next_retry_at, '')
 		FROM feed_fetch_states WHERE feed_url = ?`, feedURL)
 	var state rss.FeedFetchState
-	var fetchedAt string
-	if err := row.Scan(&state.FeedURL, &state.ETag, &state.LastModified, &state.LastStatus, &state.LastError, &state.FailCount, &fetchedAt); err != nil {
+	var fetchedAt, retryAt string
+	if err := row.Scan(&state.FeedURL, &state.ETag, &state.LastModified, &state.LastStatus, &state.LastError, &state.FailCount, &fetchedAt, &retryAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return rss.FeedFetchState{}, false, nil
 		}
 		return rss.FeedFetchState{}, false, err
 	}
 	state.LastFetchedAt = parseTime(fetchedAt)
+	state.NextRetryAt = parseTime(retryAt)
 	return state, true, nil
 }
 
 func (db *DB) SaveFeedState(ctx context.Context, state rss.FeedFetchState) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := db.sql.ExecContext(ctx, `INSERT INTO feed_fetch_states
-		(feed_url, etag, last_modified, last_status, last_error, fail_count, last_fetched_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		(feed_url, etag, last_modified, last_status, last_error, fail_count, last_fetched_at, next_retry_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(feed_url) DO UPDATE SET
 			etag = excluded.etag,
 			last_modified = excluded.last_modified,
@@ -510,6 +531,7 @@ func (db *DB) SaveFeedState(ctx context.Context, state rss.FeedFetchState) error
 			last_error = excluded.last_error,
 			fail_count = excluded.fail_count,
 			last_fetched_at = excluded.last_fetched_at,
+			next_retry_at = excluded.next_retry_at,
 			updated_at = excluded.updated_at`,
 		state.FeedURL,
 		state.ETag,
@@ -518,13 +540,14 @@ func (db *DB) SaveFeedState(ctx context.Context, state rss.FeedFetchState) error
 		state.LastError,
 		state.FailCount,
 		formatTime(state.LastFetchedAt),
+		formatTime(state.NextRetryAt),
 		now,
 	)
 	return err
 }
 
 func (db *DB) ListSourceHealth(ctx context.Context) ([]SourceHealth, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT feed_url, last_status, COALESCE(last_error, ''), fail_count, COALESCE(last_fetched_at, '')
+	rows, err := db.sql.QueryContext(ctx, `SELECT feed_url, last_status, COALESCE(last_error, ''), fail_count, COALESCE(last_fetched_at, ''), COALESCE(next_retry_at, '')
 		FROM feed_fetch_states ORDER BY last_fetched_at DESC`)
 	if err != nil {
 		return nil, err
@@ -533,11 +556,12 @@ func (db *DB) ListSourceHealth(ctx context.Context) ([]SourceHealth, error) {
 	var result []SourceHealth
 	for rows.Next() {
 		var item SourceHealth
-		var fetched string
-		if err := rows.Scan(&item.URL, &item.Status, &item.LastError, &item.FailCount, &fetched); err != nil {
+		var fetched, retryAt string
+		if err := rows.Scan(&item.URL, &item.Status, &item.LastError, &item.FailCount, &fetched, &retryAt); err != nil {
 			return nil, err
 		}
 		item.LastFetchedAt = parseTime(fetched)
+		item.NextRetryAt = parseTime(retryAt)
 		result = append(result, item)
 	}
 	return result, rows.Err()
@@ -656,6 +680,107 @@ func (db *DB) UpsertProfileItem(ctx context.Context, profileID string, item rss.
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (db *DB) UpsertItemsForProfile(ctx context.Context, profileID string, items []rss.Item) error {
+	if len(items) == 0 {
+		return nil
+	}
+	profileID = normalizeProfileID(profileID)
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, item := range items {
+		feedTags, err := json.Marshal(item.FeedTags)
+		if err != nil {
+			return err
+		}
+		categories, err := json.Marshal(item.Categories)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO items(id,feed_name,feed_url,feed_tags_json,title,link,guid,author,categories_json,published_at,updated_at,summary,content,content_hash,created_at,updated_db_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET feed_name=excluded.feed_name,feed_url=excluded.feed_url,feed_tags_json=excluded.feed_tags_json,title=excluded.title,link=excluded.link,guid=excluded.guid,author=excluded.author,categories_json=excluded.categories_json,published_at=excluded.published_at,updated_at=excluded.updated_at,summary=excluded.summary,content=excluded.content,content_hash=excluded.content_hash,updated_db_at=excluded.updated_db_at`, item.StableID(), item.FeedName, item.FeedURL, string(feedTags), item.Title, item.Link, item.GUID, item.Author, string(categories), formatTime(item.PublishedAt), formatTime(item.UpdatedAt), item.Summary, item.Content, item.ContentHash(), now, now); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO profile_items(profile_id,item_id,added_at) VALUES(?,?,?) ON CONFLICT(profile_id,item_id) DO UPDATE SET added_at=excluded.added_at`, profileID, item.StableID(), now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (db *DB) CleanupOldItems(ctx context.Context, profileID string, cutoff time.Time) (int, error) {
+	profileID = normalizeProfileID(profileID)
+	protected := map[string]bool{}
+	rows, err := db.sql.QueryContext(ctx, `SELECT item_id FROM profile_feedback WHERE profile_id=? AND action IN ('save','later')`, profileID)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		protected[id] = true
+	}
+	rows.Close()
+	editions, err := db.DigestEditions(ctx, profileID, 10000)
+	if err != nil {
+		return 0, err
+	}
+	for _, edition := range editions {
+		for _, id := range edition.ItemIDs {
+			protected[id] = true
+		}
+	}
+	rows, err = db.sql.QueryContext(ctx, `SELECT i.id,i.feed_url FROM profile_items p JOIN items i ON i.id=p.item_id WHERE p.profile_id=? AND COALESCE(NULLIF(i.published_at,''),NULLIF(i.updated_at,''),i.created_at) < ?`, profileID, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id, feedURL string
+		if err := rows.Scan(&id, &feedURL); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if !protected[id] && !strings.HasPrefix(feedURL, "manual://") {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM profile_items WHERE profile_id=? AND item_id=?`, profileID, id); err != nil {
+			return 0, err
+		}
+		var refs int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM profile_items WHERE item_id=?`, id).Scan(&refs); err != nil {
+			return 0, err
+		}
+		if refs == 0 {
+			for _, query := range []string{`DELETE FROM analysis_tasks WHERE item_id=?`, `DELETE FROM item_analyses WHERE item_id=?`, `DELETE FROM profile_seen_items WHERE item_id=?`, `DELETE FROM profile_feedback WHERE item_id=?`, `DELETE FROM item_feedback WHERE item_id=?`, `DELETE FROM items WHERE id=?`} {
+				if _, err = tx.ExecContext(ctx, query, id); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
 }
 
 func (db *DB) ItemForProfile(ctx context.Context, profileID string, itemID string) (rss.Item, error) {
@@ -1221,7 +1346,7 @@ func (db *DB) DigestItemsForProfile(ctx context.Context, profileID string, profi
 		LEFT JOIN item_analyses a ON a.item_id = i.id AND a.profile_hash = ? AND a.content_hash = i.content_hash
 		LEFT JOIN profile_seen_items s ON s.profile_id = p.profile_id AND s.item_id = p.item_id
 		WHERE p.profile_id = ?
-		ORDER BY CASE WHEN COALESCE(a.should_push, 0) = 1 THEN 0 ELSE 1 END, a.score DESC, p.added_at DESC
+		ORDER BY CASE WHEN a.item_id IS NULL THEN 1 ELSE 0 END, a.score DESC, p.added_at DESC
 		LIMIT ?`, profileHash, profileID, limit)
 	if err != nil {
 		return nil, err

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +28,7 @@ type FeedFetchState struct {
 	LastError     string
 	FailCount     int
 	LastFetchedAt time.Time
+	NextRetryAt   time.Time
 }
 
 type FeedStateStore interface {
@@ -121,6 +124,9 @@ func (f *Fetcher) fetchOne(ctx context.Context, feed config.Feed, store FeedStat
 			state = saved
 		}
 	}
+	if state.NextRetryAt.After(time.Now()) {
+		return nil, false, fmt.Errorf("限流冷却中，%s 后重试", state.NextRetryAt.Local().Format("2006-01-02 15:04:05"))
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feed.URL, nil)
 	if err != nil {
@@ -150,12 +156,18 @@ func (f *Fetcher) fetchOne(ctx context.Context, feed config.Feed, store FeedStat
 	if resp.StatusCode == http.StatusNotModified {
 		state.LastError = ""
 		state.FailCount = 0
+		state.NextRetryAt = time.Time{}
 		saveFeedState(ctx, store, state)
 		return nil, true, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		state.LastError = resp.Status
 		state.FailCount++
+		if resp.StatusCode == http.StatusTooManyRequests {
+			state.NextRetryAt = retryAt(resp.Header.Get("Retry-After"), state.FailCount, time.Now())
+		} else {
+			state.NextRetryAt = time.Time{}
+		}
 		saveFeedState(ctx, store, state)
 		return nil, false, fmt.Errorf("HTTP %s", resp.Status)
 	}
@@ -172,8 +184,28 @@ func (f *Fetcher) fetchOne(ctx context.Context, feed config.Feed, store FeedStat
 	state.LastModified = resp.Header.Get("Last-Modified")
 	state.LastError = ""
 	state.FailCount = 0
+	state.NextRetryAt = time.Time{}
 	saveFeedState(ctx, store, state)
 	return parsed, false, nil
+}
+
+func retryAt(raw string, failCount int, now time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	if parsed, err := http.ParseTime(raw); err == nil && parsed.After(now) {
+		return parsed
+	}
+	delays := []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour}
+	index := failCount - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(delays) {
+		index = len(delays) - 1
+	}
+	return now.Add(delays[index])
 }
 
 func saveFeedState(ctx context.Context, store FeedStateStore, state FeedFetchState) {
