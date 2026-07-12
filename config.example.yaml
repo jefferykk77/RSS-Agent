@@ -51,12 +51,13 @@ settings:
     interval: 1h
     http_timeout: 20s
     lookback_hours: 72
-    max_items_per_feed: 20
+    max_items_per_feed: 0
     batch_size: 8
     min_score: 7
     max_pushes: 6
     max_candidates_per_run: 0
-    initial_items_per_feed: 10
+    initial_items_per_feed: 3
+    retention_days: 2
     analysis_rpm: 400
     analysis_tpm: 800000
     initial_token_budget: 700000
@@ -113,13 +114,6 @@ feeds:
         - openai
         - codex
       disabled: false
-    - name: Latent Space
-      url: https://www.latent.space/feed
-      tags:
-        - primary
-        - applied-ai
-        - paradigm
-      disabled: false
     - name: Reddit · Claude Engineering
       url: https://www.reddit.com/r/ClaudeCode+ClaudeAI+ClaudeWorkflows/new/.rss
       tags:
@@ -140,13 +134,6 @@ feeds:
         - primary
         - research
         - model-infra
-      disabled: false
-    - name: HN · AI Engineering
-      url: https://hnrss.org/newest?q=%22AI+agent%22+OR+%22loop+engineering%22+OR+%22harness+engineering%22+OR+%22context+engineering%22
-      tags:
-        - community
-        - paradigm
-        - applied-ai
       disabled: false
 x:
     base_url: https://api.x.com/2

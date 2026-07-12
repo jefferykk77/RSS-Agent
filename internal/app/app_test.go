@@ -32,16 +32,25 @@ func TestNewestPerFeedKeepsConfiguredCount(t *testing.T) {
 			items = append(items, rss.Item{FeedURL: feed, Title: feed, PublishedAt: base.Add(-time.Duration(i) * time.Minute)})
 		}
 	}
-	selected := newestPerFeed(items, 10)
-	if len(selected) != 20 {
-		t.Fatalf("selected=%d, want 20", len(selected))
+	selected := newestPerFeed(items, 3)
+	if len(selected) != 6 {
+		t.Fatalf("selected=%d, want 6", len(selected))
 	}
 	counts := map[string]int{}
 	for _, item := range selected {
 		counts[item.FeedURL]++
 	}
-	if counts["a"] != 10 || counts["b"] != 10 {
+	if counts["a"] != 3 || counts["b"] != 3 {
 		t.Fatalf("counts=%v", counts)
+	}
+}
+
+func TestRetentionCutoffUsesBeijingTodayAndYesterday(t *testing.T) {
+	now := time.Date(2026, 7, 12, 3, 0, 0, 0, time.UTC)
+	got := retentionCutoff(now, "Asia/Shanghai", 2)
+	want := time.Date(2026, 7, 11, 0, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	if !got.Equal(want) {
+		t.Fatalf("cutoff=%s want %s", got, want)
 	}
 }
 

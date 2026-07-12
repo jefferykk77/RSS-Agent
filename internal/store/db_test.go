@@ -25,6 +25,7 @@ func TestDBRoundTrip(t *testing.T) {
 		LastModified:  "Fri, 10 Jul 2026 01:00:00 GMT",
 		LastStatus:    200,
 		LastFetchedAt: time.Now(),
+		NextRetryAt:   time.Now().Add(15 * time.Minute),
 	}
 	if err := db.SaveFeedState(ctx, feedState); err != nil {
 		t.Fatalf("SaveFeedState() error = %v", err)
@@ -33,7 +34,7 @@ func TestDBRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFeedState() error = %v", err)
 	}
-	if !ok || gotState.ETag != feedState.ETag {
+	if !ok || gotState.ETag != feedState.ETag || gotState.NextRetryAt.IsZero() {
 		t.Fatalf("feed state = %+v, ok=%v", gotState, ok)
 	}
 
@@ -184,6 +185,109 @@ func TestRecoveryRunIncludesExistingCompletedAndPendingTasks(t *testing.T) {
 	}
 	if run.Total != 2 || run.Analyzed != 1 || run.Pending != 1 {
 		t.Fatalf("run=%+v", run)
+	}
+}
+
+func TestCleanupOldItemsProtectsSavedLaterManualAndDigest(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	old := time.Now().Add(-72 * time.Hour)
+	items := []rss.Item{{ID: "delete", FeedName: "F", FeedURL: "feed", Title: "D", PublishedAt: old}, {ID: "save", FeedName: "F", FeedURL: "feed", Title: "S", PublishedAt: old}, {ID: "later", FeedName: "F", FeedURL: "feed", Title: "L", PublishedAt: old}, {ID: "manual", FeedName: "M", FeedURL: "manual://default", Title: "M", PublishedAt: old}, {ID: "digest", FeedName: "F", FeedURL: "feed", Title: "G", PublishedAt: old}}
+	if err := db.UpsertItemsForProfile(ctx, "default", items); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordFeedbackForProfile(ctx, "default", "save", FeedbackSave); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordFeedbackForProfile(ctx, "default", "later", FeedbackLater); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordDigestEdition(ctx, "default", "manual", []string{"digest"}, true); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := db.CleanupOldItems(ctx, "default", time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d", deleted)
+	}
+	var count int
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("remaining=%d", count)
+	}
+}
+
+func TestDigestPageFiltersSourceAndUsesHybridOrder(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "page.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	items := []rss.Item{{ID: "new", FeedName: "A", FeedURL: "a", Title: "New", PublishedAt: now}, {ID: "low", FeedName: "A", FeedURL: "a", Title: "Low", PublishedAt: now.Add(-time.Hour)}, {ID: "high", FeedName: "A", FeedURL: "a", Title: "High", PublishedAt: now.Add(-2 * time.Hour)}, {ID: "other", FeedName: "B", FeedURL: "b", Title: "Other", PublishedAt: now}}
+	if err := db.UpsertItemsForProfile(ctx, "default", items); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		id    string
+		score int
+	}{{"low", 2}, {"high", 9}} {
+		item, _ := db.ItemForProfile(ctx, "default", entry.id)
+		decision := agent.Decision{ItemID: entry.id, Score: entry.score, Title: "T", Summary: "S", Why: "W", KeyPoints: []string{"P"}, Tags: []string{"t"}}
+		if err := db.SaveAnalysis(ctx, item, "profile", "m", "m", decision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := db.DigestPageForProfile(ctx, "default", "profile", "a", "hybrid", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 3 || len(page.Items) != 3 || page.Items[0].ID != "high" || page.Items[1].ID != "low" || page.Items[2].ID != "new" {
+		t.Fatalf("page=%+v", page)
+	}
+}
+
+func TestDigestPageRecommendedUsesModelRecommendation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "recommended.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	items := []rss.Item{
+		{ID: "high-not-recommended", FeedName: "A", FeedURL: "a", Title: "High", PublishedAt: now},
+		{ID: "recommended", FeedName: "A", FeedURL: "a", Title: "Recommended", PublishedAt: now.Add(-time.Hour)},
+	}
+	if err := db.UpsertItemsForProfile(ctx, "default", items); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		id          string
+		score       int
+		recommended bool
+	}{{"high-not-recommended", 10, false}, {"recommended", 7, true}} {
+		item, _ := db.ItemForProfile(ctx, "default", entry.id)
+		decision := agent.Decision{ItemID: entry.id, Score: entry.score, ShouldPush: entry.recommended, Title: "T", Summary: "S", Why: "W", KeyPoints: []string{"P"}, Tags: []string{"t"}}
+		if err := db.SaveAnalysis(ctx, item, "profile", "m", "m", decision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := db.DigestPageForProfile(ctx, "default", "profile", "", "recommended", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != "recommended" {
+		t.Fatalf("recommended page=%+v", page)
 	}
 }
 

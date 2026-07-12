@@ -306,3 +306,23 @@ func containsString(values []string, target string) bool {
 	}
 	return false
 }
+
+func TestSourceHealthState(t *testing.T) {
+	cases := []struct {
+		name  string
+		state store.SourceHealth
+		want  string
+	}{
+		{"healthy", store.SourceHealth{Status: http.StatusOK}, "healthy"},
+		{"rate limited", store.SourceHealth{Status: http.StatusTooManyRequests, FailCount: 1, NextRetryAt: time.Now().Add(time.Minute)}, "rate_limited"},
+		{"expired rate limit", store.SourceHealth{Status: http.StatusTooManyRequests, FailCount: 1, NextRetryAt: time.Now().Add(-time.Minute)}, "error"},
+		{"unknown", store.SourceHealth{}, "unknown"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sourceHealthState(test.state); got != test.want {
+				t.Fatalf("sourceHealthState()=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
